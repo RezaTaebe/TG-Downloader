@@ -127,14 +127,11 @@ jobs:
           fi
 
           # ─── Encode non-ASCII chars in URL path (keep query string intact) ─
-          # Split URL into base path + query, encode only the path part,
-          # then reassemble so ?hash= and similar params are preserved.
-          ENCODED_URL=$(python3 - "$RAW_URL" <<'PYEOF'
+          ENCODED_URL=$(python3 -c "
 import sys, urllib.parse
 
 url = sys.argv[1]
 
-# Split off query string and fragment so we don't encode them
 if '?' in url:
     path_part, rest = url.split('?', 1)
     rest = '?' + rest
@@ -144,13 +141,10 @@ elif '#' in url:
 else:
     path_part, rest = url, ''
 
-# Encode only the path: quote everything except safe URL chars
-# safe=':/@' keeps the scheme (https://) and host slashes intact
-encoded_path = urllib.parse.quote(path_part, safe=':/@.-_~!$&\'()*+,;=')
+encoded_path = urllib.parse.quote(path_part, safe=':/@.-_~!\$&\\'()*+,;=')
 
 print(encoded_path + rest)
-PYEOF
-)
+" "$RAW_URL")
 
           # ─── Extract clean filename from URL (strip query/fragment first) ─
           if [ -z "$FILE_NAME" ] || [ "$FILE_NAME" = "null" ]; then
@@ -163,7 +157,6 @@ print(name)
             FILE_NAME="$RAW_PATH"
             [ -z "$FILE_NAME" ] && FILE_NAME="telegram_file_$(date +%s)"
           else
-            # API gave us a filename — still strip any stray query params
             FILE_NAME=$(echo "$FILE_NAME" | sed 's/[?#].*//')
           fi
 
@@ -238,7 +231,7 @@ print(name)
             echo "⚠️  HTTP/2 failed (exit $?), trying HTTP/1.1..."
             rm -f "tmp_downloads/$FINAL_NAME"
 
-            # Attempt 2: force HTTP/1.1 — fixes curl error 92 (stream INTERNAL_ERROR)
+            # Attempt 2: force HTTP/1.1
             echo "🔄 Attempt 2/3 — HTTP/1.1..."
             if curl "${CURL_COMMON_ARGS[@]}" --http1.1 "$URL"; then
               DOWNLOAD_OK=true
@@ -299,17 +292,6 @@ print(name)
           REPO_NAME="${{ github.event.repository.name }}"
           BRANCH="${GITHUB_REF_NAME}"
 
-          # ═══════════════════════════════════════════════════════════════
-          # 🧠 Smart auto-split: pick part size based on actual file size
-          #
-          #  < 45 MB   → no split  (fits GitHub's 50 MB soft limit as-is)
-          #  < 500 MB  → 45 MB parts  (safe headroom, fewest parts)
-          #  < 2 GB    → 90 MB parts  (still well under 100 MB hard limit)
-          #  ≥ 2 GB    → 190 MB parts (maximise chunk, stay under limit)
-          #
-          # Every part always stays under GitHub's 100 MB hard limit and
-          # the 50 MB recommended limit where possible.
-          # ═══════════════════════════════════════════════════════════════
           FILE_SIZE_MB_INT=$(echo "$FILE_SIZE_MB" | cut -d'.' -f1)
 
           if   [ "$FILE_SIZE_MB_INT" -lt 45 ]; then
