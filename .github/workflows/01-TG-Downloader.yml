@@ -7,11 +7,6 @@ on:
         description: '🔗 Telegram post/file link'
         required: true
         type: string
-      split_threshold_mb:
-        description: '📦 Max size per split part (MB) — 0 to disable'
-        required: false
-        type: number
-        default: 45
       password:
         description: '🔐 Password for archive (optional)'
         required: false
@@ -83,7 +78,7 @@ jobs:
             FILE_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name // empty' 2>/dev/null)
           fi
 
-          # ─── Method 2: savefrom / tgsave style scrapers ─────────────────
+          # ─── Method 2: tgsave style scraper ─────────────────────────────
           if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
             echo "⚠️  Method 1 failed. Trying Method 2: tgsave.com..."
 
@@ -103,7 +98,6 @@ jobs:
           if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
             echo "⚠️  Method 2 failed. Trying Method 3: Direct CDN detection..."
 
-            # Many public Telegram posts expose CDN links in page meta tags
             PAGE_HTML=$(curl -sL --max-time 20 \
               -H "User-Agent: TelegramBot (like TwitterBot)" \
               "$TELEGRAM_LINK" 2>/dev/null || echo "")
@@ -111,7 +105,6 @@ jobs:
             RAW_URL=$(echo "$PAGE_HTML" | grep -oP 'https://cdn[0-9]*\.telesco\.pe/file/[^"]+' | head -1 || echo "")
 
             if [ -z "$RAW_URL" ]; then
-              # Try og:video or og:image as fallback
               RAW_URL=$(echo "$PAGE_HTML" | grep -oP '(?<=content=")[^"]+\.(mp4|mov|avi|mkv|pdf|zip|rar|7z|jpg|jpeg|png|gif|mp3|m4a|wav|flac)[^"]*' | head -1 || echo "")
             fi
 
@@ -133,10 +126,8 @@ jobs:
             exit 1
           fi
 
-          # Clean up the URL (spaces → dashes, strip dangerous chars)
           CLEAN_URL=$(echo "$RAW_URL" | sed 's/%20/-/g' | sed 's/ /-/g')
 
-          # Fallback filename from URL if still empty
           if [ -z "$FILE_NAME" ] || [ "$FILE_NAME" = "null" ]; then
             FILE_NAME=$(basename "$CLEAN_URL" | sed 's/[?#].*//' | sed 's/%20/-/g')
             [ -z "$FILE_NAME" ] && FILE_NAME="telegram_file_$(date +%s)"
@@ -156,9 +147,7 @@ jobs:
           URL="${{ steps.resolve.outputs.download_url }}"
           ORIGINAL_NAME="${{ steps.resolve.outputs.original_name }}"
 
-          # ─── Sanitize filename ───────────────────────────────────────────
           sanitize_name() {
-            # Remove / replace non-ASCII, collapse spaces→dashes, strip specials
             echo "$1" \
               | iconv -f utf-8 -t ascii//TRANSLIT 2>/dev/null \
               | sed 's/ /-/g' | sed 's/　/-/g' \
@@ -177,7 +166,6 @@ jobs:
 
           mkdir -p tmp_downloads
 
-          # ─── Unique filename check ───────────────────────────────────────
           BASE_NAME="${SAFE_NAME%.*}"
           EXT="${SAFE_NAME##*.}"
           [ "$EXT" = "$SAFE_NAME" ] && EXT="bin"
@@ -215,7 +203,7 @@ jobs:
 
           if [ "$SIZE" -lt 1024 ]; then
             echo "❌ ERROR: File too small (${SIZE} bytes) — likely an error page"
-            cat "tmp_downloads/$FINAL_NAME" | head -5
+            head -5 "tmp_downloads/$FINAL_NAME"
             rm "tmp_downloads/$FINAL_NAME"
             exit 1
           fi
@@ -226,17 +214,15 @@ jobs:
           echo "   📄 File : $FINAL_NAME"
           echo "   💾 Size : ${SIZE_MB} MB"
 
-          echo "file_size=$SIZE"           >> $GITHUB_OUTPUT
-          echo "file_size_mb=$SIZE_MB"     >> $GITHUB_OUTPUT
+          echo "file_size=$SIZE"             >> $GITHUB_OUTPUT
+          echo "file_size_mb=$SIZE_MB"       >> $GITHUB_OUTPUT
           echo "downloaded_name=$FINAL_NAME" >> $GITHUB_OUTPUT
-          echo "backup_dir=$BACKUP_DIR"    >> $GITHUB_OUTPUT
 
       - name: 📦 Package & organise into folder
         run: |
           FILENAME="${{ steps.download.outputs.downloaded_name }}"
           FILE_SIZE="${{ steps.download.outputs.file_size }}"
           FILE_SIZE_MB="${{ steps.download.outputs.file_size_mb }}"
-          SPLIT_MB="${{ github.event.inputs.split_threshold_mb }}"
           ZIP_PASSWORD="${{ github.event.inputs.password }}"
           BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
           TELEGRAM_LINK="${{ github.event.inputs.telegram_link }}"
@@ -245,14 +231,45 @@ jobs:
           REPO_NAME="${{ github.event.repository.name }}"
           BRANCH="${GITHUB_REF_NAME}"
 
-          [ -z "$SPLIT_MB" ] && SPLIT_MB=45
+          # ═══════════════════════════════════════════════════════════════
+          # 🧠 Smart auto-split: pick part size based on actual file size
+          #
+          #  < 45 MB   → no split  (fits GitHub's 50 MB soft limit as-is)
+          #  < 500 MB  → 45 MB parts  (safe headroom, fewest parts)
+          #  < 2 GB    → 90 MB parts  (still well under 100 MB hard limit)
+          #  ≥ 2 GB    → 190 MB parts (maximise chunk, stay under limit)
+          #
+          # Every part always stays under GitHub's 100 MB hard limit and
+          # the 50 MB recommended limit where possible.
+          # ═══════════════════════════════════════════════════════════════
+          FILE_SIZE_MB_INT=$(echo "$FILE_SIZE_MB" | cut -d'.' -f1)
+
+          if   [ "$FILE_SIZE_MB_INT" -lt 45 ]; then
+            SPLIT_MB=0
+          elif [ "$FILE_SIZE_MB_INT" -lt 500 ]; then
+            SPLIT_MB=45
+          elif [ "$FILE_SIZE_MB_INT" -lt 2048 ]; then
+            SPLIT_MB=90
+          else
+            SPLIT_MB=190
+          fi
+
           SPLIT_LIMIT=$(( SPLIT_MB * 1024 * 1024 ))
+
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "📊 Smart split decision:"
+          echo "   💾 File size  : ${FILE_SIZE_MB} MB"
+          if [ "$SPLIT_MB" -eq 0 ]; then
+            echo "   ✂️  Split      : not needed — file fits GitHub limits"
+          else
+            echo "   ✂️  Split size : ${SPLIT_MB} MB per part (auto-selected)"
+          fi
+          echo "═══════════════════════════════════════════════════════════════"
 
           urlencode() {
             python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
           }
 
-          # ─── Unique folder naming ────────────────────────────────────────
           RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta"
                         "kappa" "lambda" "sigma" "omega" "nova" "star" "moon"
                         "sun" "sky" "cloud" "river" "ocean" "mountain")
@@ -277,20 +294,14 @@ jobs:
           FINAL_FOLDER=$(get_unique_folder "downloads" "$FILENAME_NO_EXT")
           FOLDER_DIR="$BACKUP_DIR/$FINAL_FOLDER"
           mkdir -p "$FOLDER_DIR"
-
           FOLDER_ENCODED=$(urlencode "$FINAL_FOLDER")
 
-          echo "═══════════════════════════════════════════════════════════════"
           echo "📁 Target folder : $FINAL_FOLDER"
-          echo "💾 File size     : ${FILE_SIZE_MB} MB"
-          echo "✂️  Split at      : ${SPLIT_MB} MB"
-          echo "═══════════════════════════════════════════════════════════════"
 
-          # ─── Decide: split, archive, or copy ────────────────────────────
-          if [ "$SPLIT_MB" != "0" ] && [ "$FILE_SIZE" -gt "$SPLIT_LIMIT" ]; then
-            # ── Large file → split archive ──────────────────────────────
-            echo "✂️  File exceeds ${SPLIT_MB}MB — creating split 7z archive..."
+          # ─── Branch A: split archive ─────────────────────────────────────
+          if [ "$SPLIT_MB" -gt 0 ] && [ "$FILE_SIZE" -gt "$SPLIT_LIMIT" ]; then
 
+            echo "✂️  Creating split 7z archive (${SPLIT_MB} MB parts)..."
             ARCHIVE_BASE="$FOLDER_DIR/$FINAL_FOLDER"
 
             if [ -n "$ZIP_PASSWORD" ]; then
@@ -311,7 +322,6 @@ jobs:
             done
             TOTAL_ARC_MB=$(echo "scale=2; $TOTAL_ARC_SIZE / 1024 / 1024" | bc)
 
-            # Build download links table
             DOWNLOAD_LINKS_MD=""
             LINK_NUM=0
             for pf in $(ls "$FOLDER_DIR/"*.7z* 2>/dev/null | sort); do
@@ -323,7 +333,6 @@ jobs:
               DOWNLOAD_LINKS_MD="${DOWNLOAD_LINKS_MD}| ${LINK_NUM} | \`${PB}\` | [⬇️ Download](${RAW}) |"$'\n'
             done
 
-            # Write per-folder README
             {
               printf '# %s\n\n' "$FINAL_FOLDER"
               printf -- '---\n\n'
@@ -333,8 +342,8 @@ jobs:
               printf '| **File Name** | `%s` |\n' "$FILENAME_NO_EXT"
               printf '| **Source Link** | [Telegram Post](%s) |\n' "$TELEGRAM_LINK"
               printf '| **Original Size** | **%s MB** |\n' "$FILE_SIZE_MB"
-              printf '| **Archive Size** | **%s parts — %s MB** |\n' "$PART_COUNT" "$TOTAL_ARC_MB"
-              printf '| **Split Size** | **%s MB per part** |\n' "$SPLIT_MB"
+              printf '| **Archive** | **%s parts — %s MB total** |\n' "$PART_COUNT" "$TOTAL_ARC_MB"
+              printf '| **Part Size** | **%s MB per part** (auto-selected) |\n' "$SPLIT_MB"
               printf '| **Status** | ✅ Complete |\n'
               if [ -n "$ZIP_PASSWORD" ]; then
                 printf '| **Password Protected** | 🔐 **YES** |\n'
@@ -357,10 +366,10 @@ jobs:
               printf '*Downloaded via GitHub Actions Telegram Downloader*\n'
             } > "$FOLDER_DIR/README.md"
 
+          # ─── Branch B: small file + password → single 7z ─────────────────
           elif [ -n "$ZIP_PASSWORD" ]; then
-            # ── Small file + password → single 7z ──────────────────────
-            echo "🔐 Creating password-protected 7z archive..."
 
+            echo "🔐 Creating password-protected 7z archive..."
             7z a -p"${ZIP_PASSWORD}" -mhe=on -mx=0 \
               "$FOLDER_DIR/${FINAL_FOLDER}.7z" "tmp_downloads/$FILENAME"
 
@@ -395,10 +404,10 @@ jobs:
               printf '*Downloaded via GitHub Actions Telegram Downloader*\n'
             } > "$FOLDER_DIR/README.md"
 
+          # ─── Branch C: small file, no password → store as-is ─────────────
           else
-            # ── Small file, no password → copy as-is ───────────────────
-            echo "📄 File fits without splitting — storing directly..."
 
+            echo "📄 File fits without splitting — storing directly..."
             cp "tmp_downloads/$FILENAME" "$FOLDER_DIR/${FINAL_FOLDER}.${EXT}"
 
             FILE_ENC=$(urlencode "${FINAL_FOLDER}.${EXT}")
@@ -412,7 +421,7 @@ jobs:
               printf '|----------|-------|\n'
               printf '| **File Name** | `%s` |\n' "$FILENAME_NO_EXT"
               printf '| **Source Link** | [Telegram Post](%s) |\n' "$TELEGRAM_LINK"
-              printf '| **Size** | **%s MB** (single file) |\n' "$FILE_SIZE_MB"
+              printf '| **Size** | **%s MB** (single file — no split needed) |\n' "$FILE_SIZE_MB"
               printf '| **Status** | ✅ Complete |\n'
               printf '| **Password Protected** | **NO** |\n'
               printf '\n---\n\n'
@@ -425,6 +434,7 @@ jobs:
               printf '\n---\n\n'
               printf '*Downloaded via GitHub Actions Telegram Downloader*\n'
             } > "$FOLDER_DIR/README.md"
+
           fi
 
           rm -rf tmp_downloads
@@ -432,7 +442,7 @@ jobs:
           echo ""
           echo "✅ Package ready:"
           find "$FOLDER_DIR" -type f | sort
-          echo ""
+
           echo "folder_name=$FINAL_FOLDER" >> $GITHUB_ENV
 
       - name: 📤 Incremental commit & push
@@ -442,11 +452,6 @@ jobs:
           REPO_NAME="${{ github.event.repository.name }}"
           BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
 
-          urlencode() {
-            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
-          }
-
-          # ─── Regenerate master downloads/README.md ───────────────────────
           regenerate_master_readme() {
             MASTER_README="downloads/README.md"
             mkdir -p downloads
@@ -458,7 +463,6 @@ jobs:
 
             FILE_EMOJIS=("📁" "📂" "🗂️" "📦" "🗃️" "💾" "📎" "🔗" "📋" "🗄️"
                          "🎬" "🎥" "🎵" "🎶" "📸" "🖼️" "📄" "📑" "📃" "🗒️")
-
             NUM=0
             for folder in downloads/*/; do
               [ -d "$folder" ] || continue
@@ -475,7 +479,6 @@ jobs:
             echo "📋 Master README updated — $NUM folder(s) listed"
           }
 
-          # ─── Robust single-file push ─────────────────────────────────────
           push_single_file() {
             local FILE_PATH="$1"
             local MAX_RETRIES=5
@@ -510,7 +513,6 @@ jobs:
             return 1
           }
 
-          # ─── Batch push (3 files per commit) ────────────────────────────
           push_batch() {
             local BATCH_SIZE=3
             local FILES=("$@")
@@ -533,9 +535,7 @@ jobs:
                 mkdir -p downloads
                 cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
 
-                for BF in "${BATCH_FILES[@]}"; do
-                  git add "$BF" 2>/dev/null || true
-                done
+                for BF in "${BATCH_FILES[@]}"; do git add "$BF" 2>/dev/null || true; done
 
                 if ! git diff --cached --quiet 2>/dev/null; then
                   git commit -m "📲 Add batch of $BATCH_COUNT files [skip ci]" --quiet 2>/dev/null || true
@@ -567,8 +567,8 @@ jobs:
               fi
             done
 
-            # Push remaining
-            if [ ${#BATCH_FILES[@]} -gt 0 ]; do
+            # Push any remaining files in the last incomplete batch
+            if [ ${#BATCH_FILES[@]} -gt 0 ]; then
               TOTAL_PUSHED=$(( TOTAL_PUSHED + ${#BATCH_FILES[@]} ))
               echo ""
               echo ">>> 📦 Pushing final batch ($TOTAL_PUSHED / $TOTAL_FILES files)..."
@@ -601,7 +601,6 @@ jobs:
             fi
           }
 
-          # ─── Main push logic ─────────────────────────────────────────────
           echo ""
           echo "═══════════════════════════════════════════════════════════════"
           echo "🚀 Starting incremental push..."
@@ -617,7 +616,7 @@ jobs:
           echo "🔍 Scanning files..."
           ALL_FILES=()
 
-          # READMEs first (small, help navigation)
+          # READMEs first (small, aid navigation)
           while IFS= read -r -d '' FILE; do
             ALL_FILES+=("$FILE")
           done < <(find downloads -name "README.md" -print0 2>/dev/null)
@@ -625,9 +624,7 @@ jobs:
           # Then all data files
           while IFS= read -r -d '' FILE; do
             ALL_FILES+=("$FILE")
-          done < <(find downloads -type f \
-            ! -name "README.md" \
-            -print0 2>/dev/null | sort -z)
+          done < <(find downloads -type f ! -name "README.md" -print0 2>/dev/null | sort -z)
 
           TOTAL_FILES=${#ALL_FILES[@]}
           echo "📦 Files found: $TOTAL_FILES"
@@ -721,7 +718,6 @@ jobs:
           echo "├─────────────────────────────────────────────────────────────┤"
           echo "│ 🔗 Source  : ${{ github.event.inputs.telegram_link }}"
           echo "│ 📁 Folder  : downloads/${{ env.folder_name }}/"
-          echo "│ ✂️  Split   : ${{ github.event.inputs.split_threshold_mb }} MB per part"
           if [ -n "${{ github.event.inputs.password }}" ]; then
             echo "│ 🔐 Archive : Password-protected"
           else
