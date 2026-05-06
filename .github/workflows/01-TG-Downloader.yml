@@ -128,35 +128,36 @@ jobs:
 
           # ─── Encode non-ASCII chars in URL path (keep query string intact) ─
           ENCODED_URL=$(python3 -c "
-import sys, urllib.parse
+          import sys, urllib.parse
 
-url = sys.argv[1]
+          url = sys.argv[1]
 
-if '?' in url:
-    path_part, rest = url.split('?', 1)
-    rest = '?' + rest
-elif '#' in url:
-    path_part, rest = url.split('#', 1)
-    rest = '#' + rest
-else:
-    path_part, rest = url, ''
+          if '?' in url:
+              path_part, rest = url.split('?', 1)
+              rest = '?' + rest
+          elif '#' in url:
+              path_part, rest = url.split('#', 1)
+              rest = '#' + rest
+          else:
+              path_part, rest = url, ''
 
-encoded_path = urllib.parse.quote(path_part, safe=':/@.-_~!\$&\\'()*+,;=')
+          encoded_path = urllib.parse.quote(path_part, safe=':/@.-_~!\$&()*+,;=')
 
-print(encoded_path + rest)
-" "$RAW_URL")
+          print(encoded_path + rest)
+          " "$RAW_URL")
 
           # ─── Extract clean filename from URL (strip query/fragment first) ─
           if [ -z "$FILE_NAME" ] || [ "$FILE_NAME" = "null" ]; then
             RAW_PATH=$(python3 -c "
-import sys, urllib.parse
-url = sys.argv[1].split('?')[0].split('#')[0]
-name = urllib.parse.unquote(url.split('/')[-1])
-print(name)
-" "$RAW_URL")
+          import sys, urllib.parse
+          url = sys.argv[1].split('?')[0].split('#')[0]
+          name = urllib.parse.unquote(url.split('/')[-1])
+          print(name)
+          " "$RAW_URL")
             FILE_NAME="$RAW_PATH"
             [ -z "$FILE_NAME" ] && FILE_NAME="telegram_file_$(date +%s)"
           else
+            # API gave us a filename — still strip any stray query params
             FILE_NAME=$(echo "$FILE_NAME" | sed 's/[?#].*//')
           fi
 
@@ -231,7 +232,7 @@ print(name)
             echo "⚠️  HTTP/2 failed (exit $?), trying HTTP/1.1..."
             rm -f "tmp_downloads/$FINAL_NAME"
 
-            # Attempt 2: force HTTP/1.1
+            # Attempt 2: force HTTP/1.1 — fixes curl error 92 (stream INTERNAL_ERROR)
             echo "🔄 Attempt 2/3 — HTTP/1.1..."
             if curl "${CURL_COMMON_ARGS[@]}" --http1.1 "$URL"; then
               DOWNLOAD_OK=true
@@ -382,6 +383,10 @@ print(name)
               LINK_NUM=$(( LINK_NUM + 1 ))
               DOWNLOAD_LINKS_MD="${DOWNLOAD_LINKS_MD}| ${LINK_NUM} | \`${PB}\` | [⬇️ Download](${RAW}) |"$'\n'
             done
+
+            cat > "$FOLDER_DIR/README.md" << 'READMEEOF'
+          # PLACEHOLDER
+          READMEEOF
 
             {
               printf '# %s\n\n' "$FINAL_FOLDER"
