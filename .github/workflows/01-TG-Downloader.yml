@@ -126,20 +126,54 @@ jobs:
             exit 1
           fi
 
-          CLEAN_URL=$(echo "$RAW_URL" | sed 's/%20/-/g' | sed 's/ /-/g')
+          # ─── Encode non-ASCII chars in URL path (keep query string intact) ─
+          # Split URL into base path + query, encode only the path part,
+          # then reassemble so ?hash= and similar params are preserved.
+          ENCODED_URL=$(python3 - "$RAW_URL" <<'PYEOF'
+import sys, urllib.parse
 
+url = sys.argv[1]
+
+# Split off query string and fragment so we don't encode them
+if '?' in url:
+    path_part, rest = url.split('?', 1)
+    rest = '?' + rest
+elif '#' in url:
+    path_part, rest = url.split('#', 1)
+    rest = '#' + rest
+else:
+    path_part, rest = url, ''
+
+# Encode only the path: quote everything except safe URL chars
+# safe=':/@' keeps the scheme (https://) and host slashes intact
+encoded_path = urllib.parse.quote(path_part, safe=':/@.-_~!$&\'()*+,;=')
+
+print(encoded_path + rest)
+PYEOF
+)
+
+          # ─── Extract clean filename from URL (strip query/fragment first) ─
           if [ -z "$FILE_NAME" ] || [ "$FILE_NAME" = "null" ]; then
-            FILE_NAME=$(basename "$CLEAN_URL" | sed 's/[?#].*//' | sed 's/%20/-/g')
+            RAW_PATH=$(python3 -c "
+import sys, urllib.parse
+url = sys.argv[1].split('?')[0].split('#')[0]
+name = urllib.parse.unquote(url.split('/')[-1])
+print(name)
+" "$RAW_URL")
+            FILE_NAME="$RAW_PATH"
             [ -z "$FILE_NAME" ] && FILE_NAME="telegram_file_$(date +%s)"
+          else
+            # API gave us a filename — still strip any stray query params
+            FILE_NAME=$(echo "$FILE_NAME" | sed 's/[?#].*//')
           fi
 
           echo ""
           echo "✅ Link resolved successfully!"
           echo "📄 Filename   : $FILE_NAME"
-          echo "🔗 Direct URL : $CLEAN_URL"
+          echo "🔗 Direct URL : $ENCODED_URL"
 
-          echo "download_url=$CLEAN_URL"  >> $GITHUB_OUTPUT
-          echo "original_name=$FILE_NAME" >> $GITHUB_OUTPUT
+          echo "download_url=$ENCODED_URL" >> $GITHUB_OUTPUT
+          echo "original_name=$FILE_NAME"  >> $GITHUB_OUTPUT
 
       - name: ⬇️ Download file
         id: download
@@ -182,20 +216,54 @@ jobs:
           echo "🔗 From        : $URL"
           echo "═══════════════════════════════════════════════════════════════"
 
-          curl -L \
-            --progress-bar \
-            --max-time 7200 \
-            --retry 10 \
-            --retry-delay 10 \
-            --retry-max-time 7200 \
-            -C - \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            -H "Referer: https://t.me/" \
-            -o "tmp_downloads/$FINAL_NAME" \
-            "$URL"
+          CURL_COMMON_ARGS=(
+            -L
+            --progress-bar
+            --max-time 7200
+            --retry 5
+            --retry-delay 10
+            --retry-max-time 3600
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            -H "Referer: https://t.me/"
+            -o "tmp_downloads/$FINAL_NAME"
+          )
 
-          if [ ! -f "tmp_downloads/$FINAL_NAME" ]; then
-            echo "❌ Download failed — file not found after curl"
+          DOWNLOAD_OK=false
+
+          # Attempt 1: default (HTTP/2)
+          echo "🔄 Attempt 1/3 — HTTP/2 (default)..."
+          if curl "${CURL_COMMON_ARGS[@]}" "$URL"; then
+            DOWNLOAD_OK=true
+          else
+            echo "⚠️  HTTP/2 failed (exit $?), trying HTTP/1.1..."
+            rm -f "tmp_downloads/$FINAL_NAME"
+
+            # Attempt 2: force HTTP/1.1 — fixes curl error 92 (stream INTERNAL_ERROR)
+            echo "🔄 Attempt 2/3 — HTTP/1.1..."
+            if curl "${CURL_COMMON_ARGS[@]}" --http1.1 "$URL"; then
+              DOWNLOAD_OK=true
+            else
+              echo "⚠️  HTTP/1.1 also failed (exit $?), trying wget fallback..."
+              rm -f "tmp_downloads/$FINAL_NAME"
+
+              # Attempt 3: wget as last resort
+              echo "🔄 Attempt 3/3 — wget..."
+              if wget -q --show-progress \
+                    --timeout=7200 \
+                    --tries=5 \
+                    --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                    --referer="https://t.me/" \
+                    -O "tmp_downloads/$FINAL_NAME" \
+                    "$URL"; then
+                DOWNLOAD_OK=true
+              else
+                echo "❌ All 3 download methods failed"
+              fi
+            fi
+          fi
+
+          if [ "$DOWNLOAD_OK" = false ] || [ ! -f "tmp_downloads/$FINAL_NAME" ]; then
+            echo "❌ Download failed after all attempts"
             exit 1
           fi
 
