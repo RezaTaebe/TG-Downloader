@@ -3,8 +3,8 @@ name: 01- 📲 Telegram File Downloader
 on:
   workflow_dispatch:
     inputs:
-      telegram_link:
-        description: '🔗 Telegram post/file link'
+      telegram_links:
+        description: '🔗 Telegram links (separate with commas, spaces, or new lines)'
         required: true
         type: string
       password:
@@ -42,740 +42,1078 @@ jobs:
       - name: 🔧 Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl jq openssl bc p7zip-full python3
+          sudo apt-get install -y curl jq openssl bc zip unzip python3 aria2
 
           echo "✅ Dependencies installed"
           echo ""
           echo "Tool versions:"
           curl --version | head -1
+          wget --version | head -1
+          aria2c --version | head -1
           jq --version
-          7z i 2>/dev/null | head -2
+          zip --version | head -2
 
-      - name: 🔍 Resolve Telegram download link
+      - name: 📁 Ensure downloads folder exists
+        run: |
+          mkdir -p downloads
+          echo "✅ Downloads folder ready"
+
+      - name: 📋 Parse & Resolve Multiple Links
         id: resolve
         run: |
-          TELEGRAM_LINK="${{ github.event.inputs.telegram_link }}"
+          python3 << 'PYEOF'
+          import os, json, subprocess, sys, re, urllib.parse
 
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "🔗 Input link: $TELEGRAM_LINK"
-          echo "═══════════════════════════════════════════════════════════════"
+          raw_input = """${{ github.event.inputs.telegram_links }}"""
 
-          # ─── Method 1: telegramdownloader.net API ───────────────────────
-          echo ""
-          echo "🌐 Method 1: Trying telegramdownloader.net..."
+          # Parse links (handle commas, spaces, newlines)
+          links = re.split(r'[,\s\n]+', raw_input)
+          links = [l.strip() for l in links if l.strip() and l.strip().startswith('http')]
 
-          RESPONSE=$(curl -s --max-time 30 -X POST \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "telegram_link=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$TELEGRAM_LINK")" \
-            https://telegramdownloader.net/proxy.php 2>/dev/null || echo "FAILED")
+          # Remove duplicates while preserving order
+          seen = set()
+          unique_links = []
+          for link in links:
+              if link not in seen:
+                  seen.add(link)
+                  unique_links.append(link)
 
-          RAW_URL=""
-          FILE_NAME=""
+          print(f"{'='*60}")
+          print(f"📋 Found {len(unique_links)} unique link(s):")
+          print(f"{'='*60}")
+          for i, link in enumerate(unique_links, 1):
+              print(f"  {i}. {link[:80]}...")
 
-          if [ "$RESPONSE" != "FAILED" ] && [ -n "$RESPONSE" ]; then
-            RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link // empty' 2>/dev/null)
-            FILE_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name // empty' 2>/dev/null)
-          fi
+          if not unique_links:
+              print("❌ No valid links found!")
+              sys.exit(1)
 
-          # ─── Method 2: tgsave style scraper ─────────────────────────────
-          if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
-            echo "⚠️  Method 1 failed. Trying Method 2: tgsave.com..."
+          downloads = []
+          failed = []
 
-            RESPONSE2=$(curl -s --max-time 30 -X POST \
-              -H "User-Agent: Mozilla/5.0" \
-              -H "Content-Type: application/json" \
-              -d "{\"url\":\"$TELEGRAM_LINK\"}" \
-              https://api.tgsave.com/download 2>/dev/null || echo "FAILED")
+          for idx, telegram_link in enumerate(unique_links, 1):
+              print(f"\n{'='*60}")
+              print(f"🔍 [{idx}/{len(unique_links)}] Resolving: {telegram_link[:70]}...")
+              print(f"{'='*60}")
 
-            if [ "$RESPONSE2" != "FAILED" ] && [ -n "$RESPONSE2" ]; then
-              RAW_URL=$(echo "$RESPONSE2" | jq -r '.url // .link // .download_url // empty' 2>/dev/null)
-              FILE_NAME=$(echo "$RESPONSE2" | jq -r '.filename // .file_name // .name // empty' 2>/dev/null)
-            fi
-          fi
+              raw_url = None
+              file_name = None
 
-          # ─── Method 3: Direct CDN link detection ────────────────────────
-          if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
-            echo "⚠️  Method 2 failed. Trying Method 3: Direct CDN detection..."
+              # Method 1: telegramdownloader.net API
+              try:
+                  print("🌐 Method 1: telegramdownloader.net...")
+                  encoded_link = urllib.parse.quote(telegram_link)
+                  result = subprocess.run([
+                      'curl', '-s', '--max-time', '30', '-X', 'POST',
+                      '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                      '-H', 'Content-Type: application/x-www-form-urlencoded',
+                      '-d', f'telegram_link={encoded_link}',
+                      'https://telegramdownloader.net/proxy.php'
+                  ], capture_output=True, text=True, timeout=35)
 
-            PAGE_HTML=$(curl -sL --max-time 20 \
-              -H "User-Agent: TelegramBot (like TwitterBot)" \
-              "$TELEGRAM_LINK" 2>/dev/null || echo "")
+                  if result.returncode == 0 and result.stdout:
+                      data = json.loads(result.stdout)
+                      raw_url = data.get('data', {}).get('data', {}).get('link')
+                      file_name = data.get('data', {}).get('data', {}).get('file_name')
+                      if raw_url:
+                          print(f"✅ Method 1 succeeded!")
+              except Exception as e:
+                  print(f"⚠️ Method 1 failed: {e}")
 
-            RAW_URL=$(echo "$PAGE_HTML" | grep -oP 'https://cdn[0-9]*\.telesco\.pe/file/[^"]+' | head -1 || echo "")
+              # Method 2: tgsave.com API
+              if not raw_url:
+                  try:
+                      print("🌐 Method 2: tgsave.com...")
+                      result = subprocess.run([
+                          'curl', '-s', '--max-time', '30', '-X', 'POST',
+                          '-H', 'User-Agent: Mozilla/5.0',
+                          '-H', 'Content-Type: application/json',
+                          '-d', json.dumps({"url": telegram_link}),
+                          'https://api.tgsave.com/download'
+                      ], capture_output=True, text=True, timeout=35)
 
-            if [ -z "$RAW_URL" ]; then
-              RAW_URL=$(echo "$PAGE_HTML" | grep -oP '(?<=content=")[^"]+\.(mp4|mov|avi|mkv|pdf|zip|rar|7z|jpg|jpeg|png|gif|mp3|m4a|wav|flac)[^"]*' | head -1 || echo "")
-            fi
+                      if result.returncode == 0 and result.stdout:
+                          data = json.loads(result.stdout)
+                          raw_url = data.get('url') or data.get('link') or data.get('download_url')
+                          file_name = data.get('filename') or data.get('file_name') or data.get('name')
+                          if raw_url:
+                              print(f"✅ Method 2 succeeded!")
+                  except Exception as e:
+                      print(f"⚠️ Method 2 failed: {e}")
 
-            if [ -n "$RAW_URL" ]; then
-              FILE_NAME=$(basename "$RAW_URL" | sed 's/[?#].*//')
-              echo "✅ Found CDN link via page scrape"
-            fi
-          fi
+              # Method 3: Direct CDN scrape
+              if not raw_url:
+                  try:
+                      print("🌐 Method 3: Direct CDN detection...")
+                      result = subprocess.run([
+                          'curl', '-sL', '--max-time', '20',
+                          '-H', 'User-Agent: TelegramBot (like TwitterBot)',
+                          telegram_link
+                      ], capture_output=True, text=True, timeout=25)
 
-          # ─── Final validation ────────────────────────────────────────────
-          if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
-            echo ""
-            echo "❌ ERROR: Could not resolve a download link from: $TELEGRAM_LINK"
-            echo ""
-            echo "Troubleshooting tips:"
-            echo "  • Make sure the post/channel is PUBLIC"
-            echo "  • Use the direct post link format: https://t.me/channelname/123"
-            echo "  • Private channels are not supported"
-            exit 1
-          fi
+                      if result.returncode == 0:
+                          # Look for CDN links
+                          cdn_match = re.search(r'https://cdn[0-9]*\.telesco\.pe/file/[^"]+', result.stdout)
+                          if cdn_match:
+                              raw_url = cdn_match.group(0)
+                          else:
+                              media_match = re.search(r'content="([^"]+\.(mp4|mov|avi|mkv|pdf|zip|rar|7z|jpg|jpeg|png|gif|mp3|m4a|wav|flac)[^"]*)"', result.stdout)
+                              if media_match:
+                                  raw_url = media_match.group(1)
 
-          # ─── Encode non-ASCII chars in URL path (keep query string intact) ─
-          ENCODED_URL=$(python3 -c "
-          import sys, urllib.parse
+                          if raw_url:
+                              file_name = raw_url.split('/')[-1].split('?')[0]
+                              print(f"✅ Method 3 succeeded!")
+                  except Exception as e:
+                      print(f"⚠️ Method 3 failed: {e}")
 
-          url = sys.argv[1]
+              if raw_url:
+                  # Encode URL path properly
+                  if '?' in raw_url:
+                      path_part, query = raw_url.split('?', 1)
+                      encoded_url = urllib.parse.quote(path_part, safe=':/@.-_~!$&()*+,;=') + '?' + query
+                  else:
+                      encoded_url = urllib.parse.quote(raw_url, safe=':/@.-_~!$&()*+,;=')
 
-          if '?' in url:
-              path_part, rest = url.split('?', 1)
-              rest = '?' + rest
-          elif '#' in url:
-              path_part, rest = url.split('#', 1)
-              rest = '#' + rest
-          else:
-              path_part, rest = url, ''
+                  # Extract filename if not set
+                  if not file_name:
+                      file_name = urllib.parse.unquote(raw_url.split('/')[-1].split('?')[0])
+                  if not file_name:
+                      file_name = f"telegram_file_{idx}"
 
-          encoded_path = urllib.parse.quote(path_part, safe=':/@.-_~!\$&()*+,;=')
+                  file_name = file_name.split('?')[0].split('#')[0]
 
-          print(encoded_path + rest)
-          " "$RAW_URL")
+                  downloads.append({
+                      'telegram_link': telegram_link,
+                      'download_url': encoded_url,
+                      'file_name': file_name
+                  })
+                  print(f"📄 Filename: {file_name}")
+                  print(f"🔗 URL: {encoded_url[:80]}...")
+              else:
+                  print(f"❌ Could not resolve download link")
+                  failed.append(telegram_link)
 
-          # ─── Extract clean filename from URL (strip query/fragment first) ─
-          if [ -z "$FILE_NAME" ] || [ "$FILE_NAME" = "null" ]; then
-            RAW_PATH=$(python3 -c "
-          import sys, urllib.parse
-          url = sys.argv[1].split('?')[0].split('#')[0]
-          name = urllib.parse.unquote(url.split('/')[-1])
-          print(name)
-          " "$RAW_URL")
-            FILE_NAME="$RAW_PATH"
-            [ -z "$FILE_NAME" ] && FILE_NAME="telegram_file_$(date +%s)"
-          else
-            # API gave us a filename — still strip any stray query params
-            FILE_NAME=$(echo "$FILE_NAME" | sed 's/[?#].*//')
-          fi
+          # Save results
+          with open('/tmp/downloads_list.json', 'w') as f:
+              json.dump(downloads, f)
 
-          echo ""
-          echo "✅ Link resolved successfully!"
-          echo "📄 Filename   : $FILE_NAME"
-          echo "🔗 Direct URL : $ENCODED_URL"
+          with open('/tmp/failed_links.json', 'w') as f:
+              json.dump(failed, f)
 
-          echo "download_url=$ENCODED_URL" >> $GITHUB_OUTPUT
-          echo "original_name=$FILE_NAME"  >> $GITHUB_OUTPUT
+          print(f"\n{'='*60}")
+          print(f"📊 RESOLUTION SUMMARY")
+          print(f"{'='*60}")
+          print(f"✅ Resolved: {len(downloads)} link(s)")
+          print(f"❌ Failed: {len(failed)} link(s)")
 
-      - name: ⬇️ Download file
+          if failed:
+              print(f"\n❌ Failed links:")
+              for link in failed:
+                  print(f"   • {link[:70]}...")
+
+          if not downloads:
+              print("\n❌ No links could be resolved!")
+              sys.exit(1)
+
+          print(f"\n📥 Ready to download {len(downloads)} file(s)")
+          PYEOF
+
+      - name: ⬇️ Download All Files
         id: download
         run: |
-          URL="${{ steps.resolve.outputs.download_url }}"
-          ORIGINAL_NAME="${{ steps.resolve.outputs.original_name }}"
+          python3 << 'PYEOF'
+          import json, os, subprocess, sys, re, hashlib, glob
 
-          sanitize_name() {
-            echo "$1" \
-              | iconv -f utf-8 -t ascii//TRANSLIT 2>/dev/null \
-              | sed 's/ /-/g' | sed 's/　/-/g' \
-              | sed 's/[^a-zA-Z0-9._-]/_/g' \
-              | sed 's/__*/_/g' \
-              | sed 's/^[._-]*//' \
-              | tr -s '-'
-          }
+          def sanitize_name(filename):
+              """Sanitize filename for safe filesystem use"""
+              base, ext = os.path.splitext(filename)
+              if not ext:
+                  ext = '.bin'
 
-          SAFE_NAME=$(sanitize_name "$ORIGINAL_NAME")
-          [ -z "$SAFE_NAME" ] && SAFE_NAME="telegram_file_$(date +%s).bin"
+              # Check for non-ASCII characters
+              if not all(ord(c) < 128 for c in base):
+                  # Use hash for non-ASCII names
+                  safe_base = hashlib.md5(filename.encode('utf-8')).hexdigest()[:12]
+              else:
+                  safe_base = re.sub(r'[^a-zA-Z0-9._-]', '_', base)
+                  safe_base = re.sub(r'_+', '_', safe_base)
+                  safe_base = safe_base.strip('_.-')
+                  if not safe_base:
+                      safe_base = hashlib.md5(filename.encode('utf-8')).hexdigest()[:12]
 
-          BACKUP_DIR="/tmp/tg_backup_$$"
-          mkdir -p "$BACKUP_DIR"
-          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
+              return f"{safe_base}{ext.lower()}"
 
-          mkdir -p tmp_downloads
+          def get_unique_folder_name(base_path, folder_name):
+              """Get a unique folder name, adding suffix if folder exists"""
+              folder_path = os.path.join(base_path, folder_name)
+              if not os.path.exists(folder_path):
+                  return folder_name
 
-          BASE_NAME="${SAFE_NAME%.*}"
-          EXT="${SAFE_NAME##*.}"
-          [ "$EXT" = "$SAFE_NAME" ] && EXT="bin"
+              # Folder exists, add suffix
+              counter = 1
+              while True:
+                  new_name = f"{folder_name}_copy{counter}"
+                  new_path = os.path.join(base_path, new_name)
+                  if not os.path.exists(new_path):
+                      return new_name
+                  counter += 1
 
-          FINAL_NAME="$SAFE_NAME"
-          COUNTER=1
-          while [ -f "tmp_downloads/$FINAL_NAME" ]; do
-            FINAL_NAME="${BASE_NAME}_${COUNTER}.${EXT}"
-            COUNTER=$((COUNTER + 1))
-          done
+          def download_file(url, output_path):
+              """Try multiple download methods"""
+              methods = [
+                  # Method 1: aria2c
+                  lambda: subprocess.run([
+                      'aria2c',
+                      '--max-connection-per-server=16', '--split=16', '--min-split-size=1M',
+                      '--max-tries=10', '--retry-wait=5', '--timeout=600', '--connect-timeout=60',
+                      '--allow-overwrite=true', '--auto-file-renaming=false', '--check-certificate=false',
+                      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                      '--header=Accept: */*', '--header=Accept-Language: en-US,en;q=0.9',
+                      '--header=Accept-Encoding: identity', '--header=Referer: https://t.me/',
+                      '--header=Connection: keep-alive',
+                      '--dir=' + os.path.dirname(output_path),
+                      '--out=' + os.path.basename(output_path),
+                      url
+                  ], capture_output=True, timeout=7200),
 
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "⬇️  Downloading : $FINAL_NAME"
-          echo "🔗 From        : $URL"
-          echo "═══════════════════════════════════════════════════════════════"
+                  # Method 2: curl HTTP/1.1
+                  lambda: subprocess.run([
+                      'curl', '-L', '-C', '-', '--http1.1', '--max-time', '3600',
+                      '--connect-timeout', '60', '--retry', '5', '--retry-delay', '5',
+                      '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                      '-H', 'Accept: */*', '-H', 'Accept-Encoding: identity',
+                      '-H', 'Referer: https://t.me/', '-H', 'Connection: keep-alive',
+                      '-o', output_path, url
+                  ], capture_output=True, timeout=7200),
 
-          CURL_COMMON_ARGS=(
-            -L
-            --progress-bar
-            --max-time 7200
-            --retry 5
-            --retry-delay 10
-            --retry-max-time 3600
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            -H "Referer: https://t.me/"
-            -o "tmp_downloads/$FINAL_NAME"
-          )
+                  # Method 3: wget
+                  lambda: subprocess.run([
+                      'wget', '--timeout=600', '--tries=10', '--retry-connrefused', '--continue',
+                      '--no-check-certificate',
+                      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                      '--header=Accept: */*', '--header=Accept-Encoding: identity',
+                      '--header=Referer: https://t.me/',
+                      '-O', output_path, url
+                  ], capture_output=True, timeout=7200),
+              ]
 
-          DOWNLOAD_OK=false
+              method_names = ['aria2c', 'curl', 'wget']
 
-          # Attempt 1: default (HTTP/2)
-          echo "🔄 Attempt 1/3 — HTTP/2 (default)..."
-          if curl "${CURL_COMMON_ARGS[@]}" "$URL"; then
-            DOWNLOAD_OK=true
-          else
-            echo "⚠️  HTTP/2 failed (exit $?), trying HTTP/1.1..."
-            rm -f "tmp_downloads/$FINAL_NAME"
+              for i, method in enumerate(methods):
+                  try:
+                      print(f"    🔄 Attempt {i+1}/3 — {method_names[i]}...")
+                      if os.path.exists(output_path):
+                          os.remove(output_path)
 
-            # Attempt 2: force HTTP/1.1 — fixes curl error 92 (stream INTERNAL_ERROR)
-            echo "🔄 Attempt 2/3 — HTTP/1.1..."
-            if curl "${CURL_COMMON_ARGS[@]}" --http1.1 "$URL"; then
-              DOWNLOAD_OK=true
-            else
-              echo "⚠️  HTTP/1.1 also failed (exit $?), trying wget fallback..."
-              rm -f "tmp_downloads/$FINAL_NAME"
+                      result = method()
 
-              # Attempt 3: wget as last resort
-              echo "🔄 Attempt 3/3 — wget..."
-              if wget -q --show-progress \
-                    --timeout=7200 \
-                    --tries=5 \
-                    --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                    --referer="https://t.me/" \
-                    -O "tmp_downloads/$FINAL_NAME" \
-                    "$URL"; then
-                DOWNLOAD_OK=true
-              else
-                echo "❌ All 3 download methods failed"
-              fi
-            fi
-          fi
+                      # Clean up .aria2 metadata files
+                      aria2_file = output_path + '.aria2'
+                      if os.path.exists(aria2_file):
+                          os.remove(aria2_file)
+                          print(f"    🧹 Cleaned up .aria2 metadata file")
 
-          if [ "$DOWNLOAD_OK" = false ] || [ ! -f "tmp_downloads/$FINAL_NAME" ]; then
-            echo "❌ Download failed after all attempts"
-            exit 1
-          fi
+                      if os.path.exists(output_path):
+                          size = os.path.getsize(output_path)
+                          if size > 1024:
+                              print(f"    ✅ Success with {method_names[i]}!")
+                              return True
 
-          SIZE=$(stat -c%s "tmp_downloads/$FINAL_NAME")
+                      print(f"    ⚠️ {method_names[i]} failed")
+                  except Exception as e:
+                      print(f"    ⚠️ {method_names[i]} error: {e}")
 
-          if [ "$SIZE" -lt 1024 ]; then
-            echo "❌ ERROR: File too small (${SIZE} bytes) — likely an error page"
-            head -5 "tmp_downloads/$FINAL_NAME"
-            rm "tmp_downloads/$FINAL_NAME"
-            exit 1
-          fi
+              return False
 
-          SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
-          echo ""
-          echo "✅ Download complete!"
-          echo "   📄 File : $FINAL_NAME"
-          echo "   💾 Size : ${SIZE_MB} MB"
+          # Load downloads list
+          with open('/tmp/downloads_list.json', 'r') as f:
+              downloads = json.load(f)
 
-          echo "file_size=$SIZE"             >> $GITHUB_OUTPUT
-          echo "file_size_mb=$SIZE_MB"       >> $GITHUB_OUTPUT
-          echo "downloaded_name=$FINAL_NAME" >> $GITHUB_OUTPUT
+          if not downloads:
+              print("❌ No files to download!")
+              sys.exit(1)
 
-      - name: 📦 Package & organise into folder
+          # Ensure downloads folder exists
+          os.makedirs('downloads', exist_ok=True)
+
+          downloaded_files = []
+          failed_downloads = []
+
+          for idx, item in enumerate(downloads, 1):
+              url = item['download_url']
+              original_name = item['file_name']
+              telegram_link = item['telegram_link']
+
+              safe_name = sanitize_name(original_name)
+
+              # Create folder name from filename (without extension)
+              folder_base_name = os.path.splitext(safe_name)[0]
+
+              # Get unique folder name (add suffix if folder exists)
+              folder_name = get_unique_folder_name('downloads', folder_base_name)
+              folder_path = os.path.join('downloads', folder_name)
+              os.makedirs(folder_path, exist_ok=True)
+
+              print(f"\n{'='*60}")
+              print(f"⬇️ [{idx}/{len(downloads)}] Downloading: {original_name}")
+              print(f"📄 Safe name: {safe_name}")
+              print(f"📁 Folder: {folder_name}")
+              print(f"🔗 From: {telegram_link[:60]}...")
+              print(f"{'='*60}")
+
+              output_path = os.path.join(folder_path, safe_name)
+
+              if download_file(url, output_path):
+                  # Clean up any remaining .aria2 files in the folder
+                  for aria2_file in glob.glob(os.path.join(folder_path, '*.aria2')):
+                      os.remove(aria2_file)
+                      print(f"🧹 Cleaned up: {os.path.basename(aria2_file)}")
+
+                  size = os.path.getsize(output_path)
+                  size_mb = size / (1024 * 1024)
+                  print(f"✅ Downloaded: {folder_name}/{safe_name} ({size_mb:.2f} MB)")
+
+                  downloaded_files.append({
+                      'filename': safe_name,
+                      'folder_name': folder_name,
+                      'original_name': original_name,
+                      'telegram_link': telegram_link,
+                      'size_bytes': size,
+                      'size_mb': round(size_mb, 2),
+                      'status': 'success'
+                  })
+              else:
+                  print(f"❌ All download methods failed for: {original_name}")
+                  # Keep the folder for failed downloads to track them
+                  failed_downloads.append({
+                      'original_name': original_name,
+                      'folder_name': folder_name,
+                      'telegram_link': telegram_link,
+                      'status': 'failed'
+                  })
+
+          # Final cleanup: remove any .aria2 files that might have been left behind
+          for aria2_file in glob.glob('downloads/**/*.aria2', recursive=True):
+              os.remove(aria2_file)
+              print(f"🧹 Final cleanup: {aria2_file}")
+
+          # Save results
+          with open('/tmp/downloaded_files.json', 'w') as f:
+              json.dump(downloaded_files, f)
+
+          with open('/tmp/failed_downloads.json', 'w') as f:
+              json.dump(failed_downloads, f)
+
+          print(f"\n{'='*60}")
+          print(f"📊 DOWNLOAD SUMMARY")
+          print(f"{'='*60}")
+          print(f"✅ Downloaded: {len(downloaded_files)} file(s)")
+          print(f"❌ Failed: {len(failed_downloads)} file(s)")
+
+          if downloaded_files:
+              total_mb = sum(f['size_mb'] for f in downloaded_files)
+              print(f"💾 Total size: {total_mb:.2f} MB")
+
+          if not downloaded_files:
+              print("\n❌ No files were downloaded successfully!")
+              sys.exit(1)
+          PYEOF
+
+      - name: 📦 Package Files (Handle Large Files)
+        id: package
         run: |
-          FILENAME="${{ steps.download.outputs.downloaded_name }}"
-          FILE_SIZE="${{ steps.download.outputs.file_size }}"
-          FILE_SIZE_MB="${{ steps.download.outputs.file_size_mb }}"
-          ZIP_PASSWORD="${{ github.event.inputs.password }}"
-          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
-          TELEGRAM_LINK="${{ github.event.inputs.telegram_link }}"
+          python3 << 'PYEOF'
+          import os, subprocess, json, glob, shutil
 
-          REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ github.event.repository.name }}"
-          BRANCH="${GITHUB_REF_NAME}"
+          ZIP_PASSWORD = """${{ github.event.inputs.password }}"""
+          # GitHub has a 100MB file size limit, use 90MB to be safe
+          MAX_FILE_SIZE_MB = 90
 
-          FILE_SIZE_MB_INT=$(echo "$FILE_SIZE_MB" | cut -d'.' -f1)
+          # Ensure downloads folder exists
+          os.makedirs('downloads', exist_ok=True)
 
-          if   [ "$FILE_SIZE_MB_INT" -lt 45 ]; then
-            SPLIT_MB=0
-          elif [ "$FILE_SIZE_MB_INT" -lt 500 ]; then
-            SPLIT_MB=45
-          elif [ "$FILE_SIZE_MB_INT" -lt 2048 ]; then
-            SPLIT_MB=90
-          else
-            SPLIT_MB=190
-          fi
+          with open('/tmp/downloaded_files.json', 'r') as f:
+              downloaded_files = json.load(f)
 
-          SPLIT_LIMIT=$(( SPLIT_MB * 1024 * 1024 ))
+          if not downloaded_files:
+              print("ℹ️ No files to package")
+              exit(0)
 
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "📊 Smart split decision:"
-          echo "   💾 File size  : ${FILE_SIZE_MB} MB"
-          if [ "$SPLIT_MB" -eq 0 ]; then
-            echo "   ✂️  Split      : not needed — file fits GitHub limits"
-          else
-            echo "   ✂️  Split size : ${SPLIT_MB} MB per part (auto-selected)"
-          fi
-          echo "═══════════════════════════════════════════════════════════════"
+          packaged_files = []
 
-          urlencode() {
-            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
-          }
+          for file_info in downloaded_files:
+              filename = file_info['filename']
+              folder_name = file_info['folder_name']
+              folder_path = os.path.join('downloads', folder_name)
+              filepath = os.path.join(folder_path, filename)
 
-          RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta"
-                        "kappa" "lambda" "sigma" "omega" "nova" "star" "moon"
-                        "sun" "sky" "cloud" "river" "ocean" "mountain")
+              if not os.path.exists(filepath):
+                  continue
 
-          get_unique_folder() {
-            local BASE_PATH="$1"
-            local NAME="$2"
-            if [ ! -d "$BASE_PATH/$NAME" ] && [ ! -d "$BACKUP_DIR/$NAME" ]; then
-              echo "$NAME"; return
-            fi
-            local RAND="${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"
-            while [ -d "$BASE_PATH/${NAME}_${RAND}" ] || [ -d "$BACKUP_DIR/${NAME}_${RAND}" ]; do
-              RAND="${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"
-            done
-            echo "${NAME}_${RAND}"
-          }
+              size = os.path.getsize(filepath)
+              size_mb = size / (1024 * 1024)
 
-          FILENAME_NO_EXT="${FILENAME%.*}"
-          EXT="${FILENAME##*.}"
-          [ "$EXT" = "$FILENAME" ] && EXT="bin"
+              entry = {
+                  'original_name': file_info['original_name'],
+                  'telegram_link': file_info['telegram_link'],
+                  'folder_name': folder_name,
+                  'size_mb': round(size_mb, 2),
+                  'status': 'success',
+                  'parts': []
+              }
 
-          FINAL_FOLDER=$(get_unique_folder "downloads" "$FILENAME_NO_EXT")
-          FOLDER_DIR="$BACKUP_DIR/$FINAL_FOLDER"
-          mkdir -p "$FOLDER_DIR"
-          FOLDER_ENCODED=$(urlencode "$FINAL_FOLDER")
+              print(f"\n{'='*60}")
+              print(f"📦 Processing: {folder_name}/{filename} ({size_mb:.2f} MB)")
 
-          echo "📁 Target folder : $FINAL_FOLDER"
+              base_name = os.path.splitext(filename)[0]
+              ext = os.path.splitext(filename)[1].lower()
 
-          # ─── Branch A: split archive ─────────────────────────────────────
-          if [ "$SPLIT_MB" -gt 0 ] && [ "$FILE_SIZE" -gt "$SPLIT_LIMIT" ]; then
+              # Case A: Large file needs splitting - use ZIP split archive
+              if size_mb > MAX_FILE_SIZE_MB:
+                  print(f"✂️ File is larger than {MAX_FILE_SIZE_MB}MB, creating split ZIP archive...")
 
-            echo "✂️  Creating split 7z archive (${SPLIT_MB} MB parts)..."
-            ARCHIVE_BASE="$FOLDER_DIR/$FINAL_FOLDER"
+                  zip_base = os.path.join(folder_path, base_name)
 
-            if [ -n "$ZIP_PASSWORD" ]; then
-              7z a -v${SPLIT_MB}m -p"${ZIP_PASSWORD}" -mhe=on -mx=0 \
-                "${ARCHIVE_BASE}.7z" "tmp_downloads/$FILENAME"
-            else
-              7z a -v${SPLIT_MB}m -mx=0 \
-                "${ARCHIVE_BASE}.7z" "tmp_downloads/$FILENAME"
-            fi
+                  # Use zip -s to create proper split archive
+                  # This creates: base.z01, base.z02, ..., base.zip
+                  if ZIP_PASSWORD:
+                      cmd = ['zip', '-r', '-s', f'{MAX_FILE_SIZE_MB}m', '-P', ZIP_PASSWORD, f'{zip_base}.zip', filepath]
+                  else:
+                      cmd = ['zip', '-r', '-s', f'{MAX_FILE_SIZE_MB}m', f'{zip_base}.zip', filepath]
 
-            PART_COUNT=$(ls "$FOLDER_DIR/"*.7z* 2>/dev/null | wc -l)
-            echo "   ✅ Created $PART_COUNT parts"
+                  # Change to folder to avoid path issues in archive
+                  original_dir = os.getcwd()
+                  os.chdir(folder_path)
 
-            TOTAL_ARC_SIZE=0
-            for pf in "$FOLDER_DIR"/*; do
-              [ -f "$pf" ] || continue
-              TOTAL_ARC_SIZE=$(( TOTAL_ARC_SIZE + $(stat -c%s "$pf") ))
-            done
-            TOTAL_ARC_MB=$(echo "scale=2; $TOTAL_ARC_SIZE / 1024 / 1024" | bc)
+                  if ZIP_PASSWORD:
+                      cmd = ['zip', '-s', f'{MAX_FILE_SIZE_MB}m', '-P', ZIP_PASSWORD, f'{base_name}.zip', filename]
+                  else:
+                      cmd = ['zip', '-s', f'{MAX_FILE_SIZE_MB}m', f'{base_name}.zip', filename]
 
-            DOWNLOAD_LINKS_MD=""
-            LINK_NUM=0
-            for pf in $(ls "$FOLDER_DIR/"*.7z* 2>/dev/null | sort); do
-              [ -f "$pf" ] || continue
-              PB=$(basename "$pf")
-              PE=$(urlencode "$PB")
-              RAW="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/${PE}"
-              LINK_NUM=$(( LINK_NUM + 1 ))
-              DOWNLOAD_LINKS_MD="${DOWNLOAD_LINKS_MD}| ${LINK_NUM} | \`${PB}\` | [⬇️ Download](${RAW}) |"$'\n'
-            done
+                  result = subprocess.run(cmd, capture_output=True, text=True)
+                  os.chdir(original_dir)
 
-            cat > "$FOLDER_DIR/README.md" << 'READMEEOF'
-          # PLACEHOLDER
-          READMEEOF
+                  if result.returncode == 0:
+                      # Remove original file
+                      os.remove(filepath)
 
-            {
-              printf '# %s\n\n' "$FINAL_FOLDER"
-              printf -- '---\n\n'
-              printf '## 📋 File Information\n\n'
-              printf '| Property | Value |\n'
-              printf '|----------|-------|\n'
-              printf '| **File Name** | `%s` |\n' "$FILENAME_NO_EXT"
-              printf '| **Source Link** | [Telegram Post](%s) |\n' "$TELEGRAM_LINK"
-              printf '| **Original Size** | **%s MB** |\n' "$FILE_SIZE_MB"
-              printf '| **Archive** | **%s parts — %s MB total** |\n' "$PART_COUNT" "$TOTAL_ARC_MB"
-              printf '| **Part Size** | **%s MB per part** (auto-selected) |\n' "$SPLIT_MB"
-              printf '| **Status** | ✅ Complete |\n'
-              if [ -n "$ZIP_PASSWORD" ]; then
-                printf '| **Password Protected** | 🔐 **YES** |\n'
-              else
-                printf '| **Password Protected** | **NO** |\n'
-              fi
-              printf '\n---\n\n'
-              printf '## ⬇️ Download Links\n\n'
-              printf '| # | File | Link |\n'
-              printf '|---|------|------|\n'
-              printf '%s' "$DOWNLOAD_LINKS_MD"
-              printf '\n---\n\n'
-              printf '## 📖 How to Extract\n\n'
-              printf '1. **Download** all parts (`.7z.001`, `.7z.002`, ...)\n'
-              printf '2. **Install** [7-Zip](https://www.7-zip.org/) (Windows/Linux) or [Keka](https://www.keka.io/) (Mac)\n'
-              printf '3. **Right-click** the `.7z.001` file → **Extract Here**\n'
-              printf '4. All parts combine automatically into the original file\n'
-              [ -n "$ZIP_PASSWORD" ] && printf '5. **Enter the password** when prompted\n'
-              printf '\n---\n\n'
-              printf '*Downloaded via GitHub Actions Telegram Downloader*\n'
-            } > "$FOLDER_DIR/README.md"
+                      # Find all parts: .z01, .z02, ... and .zip
+                      zip_parts = sorted(glob.glob(os.path.join(folder_path, f'{base_name}.z[0-9]*')))
+                      main_zip = os.path.join(folder_path, f'{base_name}.zip')
 
-          # ─── Branch B: small file + password → single 7z ─────────────────
-          elif [ -n "$ZIP_PASSWORD" ]; then
+                      # Add split parts first (.z01, .z02, etc.)
+                      for part_path in zip_parts:
+                          part_name = os.path.basename(part_path)
+                          part_size = os.path.getsize(part_path) / (1024 * 1024)
+                          entry['parts'].append({
+                              'name': part_name,
+                              'size_mb': round(part_size, 2)
+                          })
+                          print(f"  ✅ Created: {part_name} ({part_size:.2f} MB)")
 
-            echo "🔐 Creating password-protected 7z archive..."
-            7z a -p"${ZIP_PASSWORD}" -mhe=on -mx=0 \
-              "$FOLDER_DIR/${FINAL_FOLDER}.7z" "tmp_downloads/$FILENAME"
+                      # Add main .zip file last
+                      if os.path.exists(main_zip):
+                          zip_size = os.path.getsize(main_zip) / (1024 * 1024)
+                          entry['parts'].append({
+                              'name': f'{base_name}.zip',
+                              'size_mb': round(zip_size, 2)
+                          })
+                          print(f"  ✅ Created: {base_name}.zip ({zip_size:.2f} MB)")
 
-            ARC_SIZE=$(stat -c%s "$FOLDER_DIR/${FINAL_FOLDER}.7z" 2>/dev/null || echo 0)
-            ARC_MB=$(echo "scale=2; $ARC_SIZE / 1024 / 1024" | bc)
-            FILE_ENC=$(urlencode "${FINAL_FOLDER}.7z")
-            RAW="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/${FILE_ENC}"
+                      print(f"✅ Created {len(entry['parts'])} part split archive")
+                      print(f"💡 To extract: Download ALL parts to same folder, then extract the .zip file")
+                  else:
+                      print(f"⚠️ ZIP split failed: {result.stderr}")
+                      print(f"Keeping original file")
+                      entry['parts'].append({'name': filename, 'size_mb': round(size_mb, 2)})
 
-            {
-              printf '# %s\n\n' "$FINAL_FOLDER"
-              printf -- '---\n\n'
-              printf '## 📋 File Information\n\n'
-              printf '| Property | Value |\n'
-              printf '|----------|-------|\n'
-              printf '| **File Name** | `%s` |\n' "$FILENAME_NO_EXT"
-              printf '| **Source Link** | [Telegram Post](%s) |\n' "$TELEGRAM_LINK"
-              printf '| **Original Size** | **%s MB** |\n' "$FILE_SIZE_MB"
-              printf '| **Archive Size** | **%s MB** |\n' "$ARC_MB"
-              printf '| **Status** | ✅ Complete |\n'
-              printf '| **Password Protected** | 🔐 **YES** |\n'
-              printf '\n---\n\n'
-              printf '## ⬇️ Download Link\n\n'
-              printf '| # | File | Link |\n'
-              printf '|---|------|------|\n'
-              printf '| 1 | `%s.7z` | [⬇️ Download](%s) |\n' "$FINAL_FOLDER" "$RAW"
-              printf '\n---\n\n'
-              printf '## 📖 How to Extract\n\n'
-              printf '1. **Install** [7-Zip](https://www.7-zip.org/) (Windows/Linux) or [Keka](https://www.keka.io/) (Mac)\n'
-              printf '2. **Right-click** the `.7z` file → **Extract Here**\n'
-              printf '3. **Enter the password** when prompted\n'
-              printf '\n---\n\n'
-              printf '*Downloaded via GitHub Actions Telegram Downloader*\n'
-            } > "$FOLDER_DIR/README.md"
+              # Case B: Password requested - create password-protected ZIP
+              elif ZIP_PASSWORD:
+                  print(f"🔐 Creating password-protected ZIP...")
+                  zip_name = f'{base_name}.zip'
 
-          # ─── Branch C: small file, no password → store as-is ─────────────
-          else
+                  original_dir = os.getcwd()
+                  os.chdir(folder_path)
 
-            echo "📄 File fits without splitting — storing directly..."
-            cp "tmp_downloads/$FILENAME" "$FOLDER_DIR/${FINAL_FOLDER}.${EXT}"
+                  cmd = ['zip', '-P', ZIP_PASSWORD, zip_name, filename]
+                  result = subprocess.run(cmd, capture_output=True, text=True)
+                  os.chdir(original_dir)
 
-            FILE_ENC=$(urlencode "${FINAL_FOLDER}.${EXT}")
-            RAW="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/downloads/${FOLDER_ENCODED}/${FILE_ENC}"
+                  zip_path = os.path.join(folder_path, zip_name)
+                  if result.returncode == 0 and os.path.exists(zip_path):
+                      os.remove(filepath)
+                      zip_size = os.path.getsize(zip_path) / (1024 * 1024)
+                      entry['parts'].append({'name': zip_name, 'size_mb': round(zip_size, 2)})
+                      print(f"✅ Created: {zip_name} ({zip_size:.2f} MB)")
+                  else:
+                      print(f"⚠️ ZIP failed, keeping original")
+                      entry['parts'].append({'name': filename, 'size_mb': round(size_mb, 2)})
 
-            {
-              printf '# %s\n\n' "$FINAL_FOLDER"
-              printf -- '---\n\n'
-              printf '## 📋 File Information\n\n'
-              printf '| Property | Value |\n'
-              printf '|----------|-------|\n'
-              printf '| **File Name** | `%s` |\n' "$FILENAME_NO_EXT"
-              printf '| **Source Link** | [Telegram Post](%s) |\n' "$TELEGRAM_LINK"
-              printf '| **Size** | **%s MB** (single file — no split needed) |\n' "$FILE_SIZE_MB"
-              printf '| **Status** | ✅ Complete |\n'
-              printf '| **Password Protected** | **NO** |\n'
-              printf '\n---\n\n'
-              printf '## ⬇️ Download Link\n\n'
-              printf '| # | File | Link |\n'
-              printf '|---|------|------|\n'
-              printf '| 1 | `%s.%s` | [⬇️ Download](%s) |\n' "$FINAL_FOLDER" "$EXT" "$RAW"
-              printf '\n---\n\n'
-              printf 'Ready to use — no extraction needed!\n'
-              printf '\n---\n\n'
-              printf '*Downloaded via GitHub Actions Telegram Downloader*\n'
-            } > "$FOLDER_DIR/README.md"
+              # Case C: Small file, no password - KEEP AS-IS (no unnecessary zipping!)
+              else:
+                  print(f"📄 File is under {MAX_FILE_SIZE_MB}MB, keeping original format")
+                  entry['parts'].append({'name': filename, 'size_mb': round(size_mb, 2)})
 
-          fi
+              packaged_files.append(entry)
 
-          rm -rf tmp_downloads
+          # Add failed downloads to packaged_files for README generation
+          try:
+              with open('/tmp/failed_downloads.json', 'r') as f:
+                  failed_downloads = json.load(f)
+                  for failed in failed_downloads:
+                      packaged_files.append({
+                          'original_name': failed['original_name'],
+                          'telegram_link': failed['telegram_link'],
+                          'folder_name': failed.get('folder_name', 'unknown'),
+                          'size_mb': 0,
+                          'status': 'failed',
+                          'parts': []
+                      })
+          except:
+              pass
 
-          echo ""
-          echo "✅ Package ready:"
-          find "$FOLDER_DIR" -type f | sort
+          with open('/tmp/packaged_files.json', 'w') as f:
+              json.dump(packaged_files, f)
 
-          echo "folder_name=$FINAL_FOLDER" >> $GITHUB_ENV
+          print(f"\n{'='*60}")
+          print(f"📂 Final structure in downloads/:")
+          for folder in sorted(os.listdir('downloads')):
+              folder_path = os.path.join('downloads', folder)
+              if os.path.isdir(folder_path):
+                  print(f"  📁 {folder}/")
+                  for f in sorted(os.listdir(folder_path)):
+                      fpath = os.path.join(folder_path, f)
+                      if os.path.isfile(fpath):
+                          fsize = os.path.getsize(fpath) / (1024 * 1024)
+                          print(f"      • {f} ({fsize:.2f} MB)")
+          PYEOF
 
-      - name: 📤 Incremental commit & push
+      - name: 📝 Generate README files for each folder
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          from datetime import datetime
+          from urllib.parse import quote
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          branch = os.environ['GITHUB_REF_NAME']
+
+          # Ensure downloads folder exists
+          os.makedirs('downloads', exist_ok=True)
+
+          with open('/tmp/packaged_files.json', 'r') as f:
+              packaged_files = json.load(f)
+
+          today = datetime.now().strftime('%Y-%m-%d')
+          time_now = datetime.now().strftime('%H:%M:%S')
+
+          # Generate README.md for each folder
+          for file_info in packaged_files:
+              folder_name = file_info['folder_name']
+              folder_path = os.path.join('downloads', folder_name)
+
+              # Create folder if it doesn't exist (for failed downloads)
+              os.makedirs(folder_path, exist_ok=True)
+
+              original_name = file_info['original_name']
+              telegram_link = file_info['telegram_link']
+              size_mb = file_info['size_mb']
+              status = file_info.get('status', 'success')
+              parts = file_info.get('parts', [])
+
+              raw_base = f"https://github.com/{repo}/raw/refs/heads/{branch}/downloads/{quote(folder_name, safe='')}"
+
+              lines = []
+              lines.append(f"# 📄 {original_name}\n")
+              lines.append(f"**Downloaded:** {today} at {time_now}\n")
+              lines.append("---\n")
+
+              # Status section
+              lines.append("## 📊 Status\n")
+              if status == 'success':
+                  lines.append("| Property | Value |")
+                  lines.append("|----------|-------|")
+                  lines.append(f"| **Status** | ✅ 100% Downloaded |")
+                  lines.append(f"| **Original Name** | `{original_name}` |")
+                  lines.append(f"| **Size** | {size_mb} MB |")
+                  lines.append(f"| **Parts** | {len(parts)} |")
+                  lines.append(f"| **Source** | [Telegram Link]({telegram_link}) |")
+              else:
+                  lines.append("| Property | Value |")
+                  lines.append("|----------|-------|")
+                  lines.append(f"| **Status** | ❌ Failed |")
+                  lines.append(f"| **Original Name** | `{original_name}` |")
+                  lines.append(f"| **Source** | [Telegram Link]({telegram_link}) |")
+                  lines.append("")
+                  lines.append("> ⚠️ This file could not be downloaded. Please try again or download manually from the source link.")
+
+              lines.append("\n---\n")
+
+              # Download links section (only for successful downloads)
+              if status == 'success' and parts:
+                  lines.append("## 📥 Download Links\n")
+
+                  # Check if this is a split archive (has .z01, .z02, etc.)
+                  has_split_parts = any(p['name'].endswith(('.z01', '.z02', '.z03', '.z04', '.z05')) for p in parts)
+
+                  if has_split_parts:
+                      # Split ZIP archive
+                      lines.append(f"This file has been split into **{len(parts)} parts** due to size limitations.\n")
+                      lines.append("| # | File | Size | Download |")
+                      lines.append("|---|------|------|----------|")
+                      for i, part in enumerate(parts, 1):
+                          part_name = part['name']
+                          part_size = part['size_mb']
+                          encoded = quote(part_name, safe='')
+                          url = f"{raw_base}/{encoded}"
+                          lines.append(f"| {i} | `{part_name}` | {part_size} MB | [⬇️ Download]({url}) |")
+                      lines.append("")
+                      lines.append("### 📋 How to Extract\n")
+                      lines.append("**IMPORTANT:** Download ALL parts to the SAME folder before extracting!\n")
+                      lines.append("#### Windows:")
+                      lines.append("1. Download all files (.z01, .z02, ... and .zip) to the same folder")
+                      lines.append("2. Right-click the `.zip` file → **Extract with WinRAR** or **7-Zip → Extract Here**")
+                      lines.append("3. The tool will automatically find and use all parts\n")
+                      lines.append("#### macOS:")
+                      lines.append("1. Download all parts to the same folder")
+                      lines.append("2. Open Terminal and run: `zip -s 0 filename.zip --out combined.zip && unzip combined.zip`\n")
+                      lines.append("#### Linux:")
+                      lines.append("1. Download all parts to the same folder")
+                      lines.append("2. Run: `zip -s 0 filename.zip --out combined.zip && unzip combined.zip`")
+                      lines.append("3. Or use Ark/File Roller - open the .zip file and it will find the parts")
+                  elif len(parts) == 1:
+                      # Single file
+                      part = parts[0]
+                      part_name = part['name']
+                      part_size = part['size_mb']
+                      encoded = quote(part_name, safe='')
+                      url = f"{raw_base}/{encoded}"
+
+                      lines.append(f"| File | Size | Download |")
+                      lines.append(f"|------|------|----------|")
+                      lines.append(f"| `{part_name}` | {part_size} MB | [⬇️ Download]({url}) |")
+                      lines.append("")
+
+                      # Check file type for appropriate instructions
+                      if part_name.endswith('.zip'):
+                          lines.append("### 📋 How to Extract\n")
+                          lines.append("Simply right-click the ZIP file and extract:")
+                          lines.append("- **Windows**: Right-click → Extract All, or use WinRAR/7-Zip")
+                          lines.append("- **macOS**: Double-click the ZIP file")
+                          lines.append("- **Linux**: Right-click → Extract Here, or run `unzip filename.zip`")
+                      else:
+                          # Regular file (MP3, MP4, PDF, etc.) - no extraction needed
+                          lines.append("### 📋 How to Use\n")
+                          lines.append("This file is ready to use! No extraction needed.")
+                          lines.append("Simply download and open with your preferred application.")
+                  else:
+                      # Multiple parts but not split archive format
+                      lines.append("| # | File | Size | Download |")
+                      lines.append("|---|------|------|----------|")
+                      for i, part in enumerate(parts, 1):
+                          part_name = part['name']
+                          part_size = part['size_mb']
+                          encoded = quote(part_name, safe='')
+                          url = f"{raw_base}/{encoded}"
+                          lines.append(f"| {i} | `{part_name}` | {part_size} MB | [⬇️ Download]({url}) |")
+
+              lines.append("\n---\n")
+              lines.append(f"*Generated by GitHub Actions Telegram Downloader*")
+
+              # Write README.md for this folder
+              readme_path = os.path.join(folder_path, 'README.md')
+              with open(readme_path, 'w', encoding='utf-8') as f:
+                  f.write("\n".join(lines))
+
+              print(f"✅ Created README.md for: {folder_name}")
+
+          print(f"\n{'='*60}")
+          print(f"📝 Generated {len(packaged_files)} folder README files")
+          PYEOF
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      - name: 📝 Generate main downloads README.md
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          from datetime import datetime
+          from urllib.parse import quote
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          branch = os.environ['GITHUB_REF_NAME']
+
+          # Ensure downloads folder exists
+          os.makedirs('downloads', exist_ok=True)
+
+          with open('/tmp/packaged_files.json', 'r') as f:
+              packaged_files = json.load(f)
+
+          # Load failed links if any
+          failed_links = []
+          try:
+              with open('/tmp/failed_links.json', 'r') as f:
+                  failed_links = json.load(f)
+          except:
+              pass
+
+          today = datetime.now().strftime('%Y-%m-%d')
+          time_now = datetime.now().strftime('%H:%M:%S')
+
+          # Separate successful and failed downloads
+          successful = [f for f in packaged_files if f.get('status', 'success') == 'success']
+          failed = [f for f in packaged_files if f.get('status') == 'failed']
+
+          # Check if any files are split archives
+          has_any_split = False
+          for f in successful:
+              if any(p['name'].endswith(('.z01', '.z02', '.z03')) for p in f.get('parts', [])):
+                  has_any_split = True
+                  break
+
+          lines = []
+          lines.append("# 📥 Downloaded Telegram Files\n")
+          lines.append(f"**Last Updated:** {today} at {time_now}\n")
+          lines.append("---\n")
+
+          # Summary
+          total_files = len(successful)
+          total_failed = len(failed) + len(failed_links)
+          total_size = sum(f['size_mb'] for f in successful)
+
+          lines.append("## 📊 Summary\n")
+          lines.append("| Metric | Value |")
+          lines.append("|--------|-------|")
+          lines.append(f"| **Total Files** | {total_files} |")
+          lines.append(f"| **Total Size** | {total_size:.2f} MB |")
+          if total_failed > 0:
+              lines.append(f"| **Failed** | {total_failed} |")
+          lines.append("\n---\n")
+
+          # File listings - Successful
+          if successful:
+              lines.append("## ✅ Downloaded Files\n")
+              lines.append("| # | File | Size | Parts | Folder |")
+              lines.append("|---|------|------|-------|--------|")
+
+              for idx, file_info in enumerate(successful, 1):
+                  original_name = file_info['original_name']
+                  folder_name = file_info['folder_name']
+                  size_mb = file_info['size_mb']
+                  parts = file_info.get('parts', [])
+                  num_parts = len(parts)
+
+                  # Link to folder README
+                  folder_link = f"./{quote(folder_name, safe='')}"
+
+                  lines.append(f"| {idx} | {original_name} | {size_mb} MB | {num_parts} | [📁 {folder_name}]({folder_link}) |")
+
+              lines.append("\n---\n")
+
+          # File listings - Failed
+          if failed or failed_links:
+              lines.append("## ❌ Failed Downloads\n")
+
+              if failed:
+                  lines.append("| # | File | Source |")
+                  lines.append("|---|------|--------|")
+                  for idx, file_info in enumerate(failed, 1):
+                      original_name = file_info['original_name']
+                      telegram_link = file_info['telegram_link']
+                      lines.append(f"| {idx} | {original_name} | [Telegram]({telegram_link}) |")
+                  lines.append("")
+
+              if failed_links:
+                  lines.append("**Could not resolve these links:**\n")
+                  for link in failed_links:
+                      lines.append(f"- `{link[:80]}...`")
+
+              lines.append("\n---\n")
+
+          # How to use section
+          lines.append("## 📋 How to Use\n")
+          lines.append("1. Click on any folder link above to see the file details and download links")
+          lines.append("2. Each folder contains a `README.md` with download instructions")
+          lines.append("3. Download the file(s) and use them!\n")
+
+          # Add split archive instructions if any exist
+          if has_any_split:
+              lines.append("### ⚠️ Large Files (Split Archives)\n")
+              lines.append("Some files were split into multiple parts due to size limits.")
+              lines.append("For these files:\n")
+              lines.append("1. Download **ALL** parts (`.z01`, `.z02`, ... and `.zip`) to the **same folder**")
+              lines.append("2. Extract the `.zip` file using WinRAR or 7-Zip")
+              lines.append("3. The tool will automatically combine all parts\n")
+
+          lines.append("### Supported Tools\n")
+          lines.append("| Platform | Tools |")
+          lines.append("|----------|-------|")
+          lines.append("| **Windows** | File Explorer, WinRAR, 7-Zip |")
+          lines.append("| **macOS** | Archive Utility, The Unarchiver, Keka |")
+          lines.append("| **Linux** | File Manager, Ark, `unzip` command |")
+          lines.append("\n---\n")
+          lines.append("*Generated by GitHub Actions Telegram Downloader*")
+
+          content = "\n".join(lines)
+
+          # Write main README.md in downloads folder
+          readme_path = os.path.join('downloads', 'README.md')
+          with open(readme_path, 'w', encoding='utf-8') as f:
+              f.write(content)
+
+          print("✅ Main downloads/README.md generated successfully!")
+          print(f"\n{'='*60}")
+          print("📄 README.md Preview:")
+          print(f"{'='*60}")
+          print(content[:1500])
+          if len(content) > 1500:
+              print("\n... (truncated)")
+          PYEOF
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      - name: 📝 Generate Links.md
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          from datetime import datetime
+          from urllib.parse import quote
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          branch = os.environ['GITHUB_REF_NAME']
+
+          # Ensure downloads folder exists
+          os.makedirs('downloads', exist_ok=True)
+
+          with open('/tmp/packaged_files.json', 'r') as f:
+              packaged_files = json.load(f)
+
+          # Filter only successful downloads for Links.md
+          packaged_files = [f for f in packaged_files if f.get('status', 'success') == 'success']
+
+          # Load failed links if any
+          failed_links = []
+          try:
+              with open('/tmp/failed_links.json', 'r') as f:
+                  failed_links = json.load(f)
+          except:
+              pass
+
+          failed_downloads = []
+          try:
+              with open('/tmp/failed_downloads.json', 'r') as f:
+                  failed_downloads = json.load(f)
+          except:
+              pass
+
+          today = datetime.now().strftime('%Y-%m-%d')
+          time_now = datetime.now().strftime('%H:%M:%S')
+
+          lines = []
+          lines.append("# 📥 Telegram Downloads\n")
+          lines.append(f"**Generated:** {today} at {time_now}\n")
+          lines.append("---\n")
+
+          # Summary
+          total_files = len(packaged_files)
+          total_size = sum(f['size_mb'] for f in packaged_files)
+          lines.append(f"## 📊 Summary\n")
+          lines.append(f"| Metric | Value |")
+          lines.append(f"|--------|-------|")
+          lines.append(f"| **Files Downloaded** | {total_files} |")
+          lines.append(f"| **Total Size** | {total_size:.2f} MB |")
+          if failed_links or failed_downloads:
+              lines.append(f"| **Failed** | {len(failed_links) + len(failed_downloads)} |")
+          lines.append("\n---\n")
+
+          # File listings
+          lines.append("## 📁 Files\n")
+
+          for idx, file_info in enumerate(packaged_files, 1):
+              original_name = file_info['original_name']
+              telegram_link = file_info['telegram_link']
+              folder_name = file_info['folder_name']
+              size_mb = file_info['size_mb']
+              parts = file_info['parts']
+
+              raw_base = f"https://github.com/{repo}/raw/refs/heads/{branch}/downloads/{quote(folder_name, safe='')}"
+
+              lines.append(f"### {idx}. {original_name}\n")
+              lines.append(f"| Property | Value |")
+              lines.append(f"|----------|-------|")
+              lines.append(f"| **Status** | ✅ 100% Downloaded |")
+              lines.append(f"| **Source** | [Telegram Link]({telegram_link}) |")
+              lines.append(f"| **Folder** | `{folder_name}` |")
+              lines.append(f"| **Size** | {size_mb} MB |")
+              lines.append(f"| **Parts** | {len(parts)} |")
+              lines.append("")
+
+              # Check if this is a split archive
+              has_split_parts = any(p['name'].endswith(('.z01', '.z02', '.z03', '.z04', '.z05')) for p in parts)
+
+              if has_split_parts:
+                  lines.append("**📦 Download Parts (Split Archive):**\n")
+                  lines.append("| # | File | Size | Link |")
+                  lines.append("|---|------|------|------|")
+                  for i, part in enumerate(parts, 1):
+                      part_name = part['name']
+                      part_size = part['size_mb']
+                      encoded = quote(part_name, safe='')
+                      url = f"{raw_base}/{encoded}"
+                      lines.append(f"| {i} | `{part_name}` | {part_size} MB | [⬇️ Download]({url}) |")
+                  lines.append("")
+                  lines.append("> 💡 **To extract:** Download ALL parts to the same folder. Then extract the `.zip` file with WinRAR, 7-Zip, or any ZIP tool. All parts must be present. On macOS/Linux, you can run: `zip -s 0 filename.zip --out combined.zip && unzip combined.zip`.\n")
+              elif len(parts) == 1:
+                  part = parts[0]
+                  part_name = part['name']
+                  part_size = part['size_mb']
+                  encoded = quote(part_name, safe='')
+                  url = f"{raw_base}/{encoded}"
+                  lines.append(f"**📥 Download:** [**{part_name}**]({url}) ({part_size} MB)\n")
+
+                  if part_name.endswith('.zip'):
+                      lines.append("> 💡 **To extract:** Right-click and extract with any ZIP tool (WinRAR, 7-Zip, File Explorer, Ark)\n")
+                  else:
+                      lines.append("> 💡 **Ready to use:** No extraction needed - just download and open!\n")
+              else:
+                  lines.append("**📦 Download Parts:**\n")
+                  lines.append("| # | File | Size | Link |")
+                  lines.append("|---|------|------|------|")
+                  for i, part in enumerate(parts, 1):
+                      part_name = part['name']
+                      part_size = part['size_mb']
+                      encoded = quote(part_name, safe='')
+                      url = f"{raw_base}/{encoded}"
+                      lines.append(f"| {i} | `{part_name}` | {part_size} MB | [⬇️ Download]({url}) |")
+                  lines.append("")
+
+              lines.append("---\n")
+
+          # Failed section
+          if failed_links or failed_downloads:
+              lines.append("## ❌ Failed Items\n")
+              if failed_links:
+                  lines.append("**Could not resolve:**")
+                  for link in failed_links:
+                      lines.append(f"- {link[:80]}...")
+                  lines.append("")
+              if failed_downloads:
+                  lines.append("**Could not download:**")
+                  for item in failed_downloads:
+                      lines.append(f"- {item['original_name']} ([source]({item['telegram_link']}))")
+              lines.append("\n---\n")
+
+          # Footer
+          lines.append("\n*Generated by GitHub Actions Telegram Downloader*")
+
+          content = "\n".join(lines)
+
+          with open('Links.md', 'w', encoding='utf-8') as f:
+              f.write(content)
+
+          print("✅ Links.md generated successfully!")
+          print(f"\n{'='*60}")
+          print("📄 Links.md Preview:")
+          print(f"{'='*60}")
+          print(content[:1500])
+          if len(content) > 1500:
+              print("\n... (truncated)")
+          PYEOF
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      - name: 📤 Commit & Push All Files
         run: |
           BRANCH="${GITHUB_REF_NAME}"
-          REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME="${{ github.event.repository.name }}"
-          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
-
-          regenerate_master_readme() {
-            MASTER_README="downloads/README.md"
-            mkdir -p downloads
-
-            {
-              printf '# 📲 Telegram Downloaded Files\n\n'
-              printf -- '---\n\n'
-            } > "$MASTER_README"
-
-            FILE_EMOJIS=("📁" "📂" "🗂️" "📦" "🗃️" "💾" "📎" "🔗" "📋" "🗄️"
-                         "🎬" "🎥" "🎵" "🎶" "📸" "🖼️" "📄" "📑" "📃" "🗒️")
-            NUM=0
-            for folder in downloads/*/; do
-              [ -d "$folder" ] || continue
-              FOLDER_NAME=$(basename "$folder")
-              [ -f "$folder/README.md" ] || continue
-              NUM=$(( NUM + 1 ))
-              EMOJI="${FILE_EMOJIS[$RANDOM % ${#FILE_EMOJIS[@]}]}"
-              FENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$FOLDER_NAME")
-              LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/tree/${BRANCH}/downloads/${FENC}"
-              printf -- '- %d %s [%s](%s)\n' "$NUM" "$EMOJI" "$FOLDER_NAME" "$LINK" >> "$MASTER_README"
-            done
-
-            printf '\n---\n\n*Auto-generated by GitHub Actions Telegram Downloader*\n' >> "$MASTER_README"
-            echo "📋 Master README updated — $NUM folder(s) listed"
-          }
-
-          push_single_file() {
-            local FILE_PATH="$1"
-            local MAX_RETRIES=5
-            local RETRY=0
-            while [ $RETRY -lt $MAX_RETRIES ]; do
-              RETRY=$(( RETRY + 1 ))
-              git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-              LOCAL_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "none")
-              REMOTE_HEAD=$(git rev-parse origin/"$BRANCH" 2>/dev/null || echo "none")
-              if [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ] && [ "$REMOTE_HEAD" != "none" ]; then
-                git reset --hard origin/"$BRANCH" 2>/dev/null || true
-                mkdir -p downloads
-                cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-              fi
-              git add "$FILE_PATH" 2>/dev/null || true
-              if git diff --cached --quiet 2>/dev/null; then
-                echo "    ⏭️  Already uploaded: $FILE_PATH"
-                return 0
-              fi
-              FNAME=$(basename "$FILE_PATH")
-              git commit -m "📲 Add: $FNAME [skip ci]" --quiet 2>/dev/null || true
-              echo "    🚀 Push attempt $RETRY/$MAX_RETRIES..."
-              if timeout 120 git push origin HEAD:"$BRANCH" 2>&1; then
-                echo "    ✅ Success!"
-                return 0
-              else
-                echo "    ⚠️  Failed, retrying..."
-                sleep $(( 2 + RANDOM % 5 ))
-              fi
-            done
-            echo "    ❌ WARNING: Could not push $FILE_PATH after $MAX_RETRIES attempts"
-            return 1
-          }
-
-          push_batch() {
-            local BATCH_SIZE=3
-            local FILES=("$@")
-            local BATCH_COUNT=0
-            local BATCH_FILES=()
-            local TOTAL_PUSHED=0
-            local TOTAL_FILES=${#FILES[@]}
-
-            for FILE in "${FILES[@]}"; do
-              BATCH_FILES+=("$FILE")
-              BATCH_COUNT=$(( BATCH_COUNT + 1 ))
-
-              if [ $BATCH_COUNT -ge $BATCH_SIZE ]; then
-                TOTAL_PUSHED=$(( TOTAL_PUSHED + BATCH_COUNT ))
-                echo ""
-                echo ">>> 📦 Pushing batch ($TOTAL_PUSHED / $TOTAL_FILES files)..."
-
-                git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-                git reset --hard origin/"$BRANCH" 2>/dev/null || true
-                mkdir -p downloads
-                cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-
-                for BF in "${BATCH_FILES[@]}"; do git add "$BF" 2>/dev/null || true; done
-
-                if ! git diff --cached --quiet 2>/dev/null; then
-                  git commit -m "📲 Add batch of $BATCH_COUNT files [skip ci]" --quiet 2>/dev/null || true
-                  local PR=0; local PS=false
-                  while [ $PR -lt 5 ]; do
-                    PR=$(( PR + 1 ))
-                    if timeout 180 git push origin HEAD:"$BRANCH" 2>&1; then
-                      PS=true; echo "    ✅ Batch pushed!"; break
-                    else
-                      echo "    ⚠️  Retry $PR/5..."
-                      git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-                      git reset --hard origin/"$BRANCH" 2>/dev/null || true
-                      mkdir -p downloads
-                      cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-                      for BF in "${BATCH_FILES[@]}"; do git add "$BF" 2>/dev/null || true; done
-                      if ! git diff --cached --quiet 2>/dev/null; then
-                        git commit -m "📲 Add batch of $BATCH_COUNT files [skip ci]" --quiet 2>/dev/null || true
-                      fi
-                      sleep $(( 3 + RANDOM % 7 ))
-                    fi
-                  done
-                  if [ "$PS" = false ]; then
-                    echo "    ⚠️  Batch failed — pushing individually..."
-                    for BF in "${BATCH_FILES[@]}"; do push_single_file "$BF"; done
-                  fi
-                fi
-
-                BATCH_FILES=(); BATCH_COUNT=0; sleep 2
-              fi
-            done
-
-            # Push any remaining files in the last incomplete batch
-            if [ ${#BATCH_FILES[@]} -gt 0 ]; then
-              TOTAL_PUSHED=$(( TOTAL_PUSHED + ${#BATCH_FILES[@]} ))
-              echo ""
-              echo ">>> 📦 Pushing final batch ($TOTAL_PUSHED / $TOTAL_FILES files)..."
-              git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-              git reset --hard origin/"$BRANCH" 2>/dev/null || true
-              mkdir -p downloads
-              cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-              for BF in "${BATCH_FILES[@]}"; do git add "$BF" 2>/dev/null || true; done
-              if ! git diff --cached --quiet 2>/dev/null; then
-                git commit -m "📲 Add final batch [skip ci]" --quiet 2>/dev/null || true
-                local PR=0
-                while [ $PR -lt 5 ]; do
-                  PR=$(( PR + 1 ))
-                  if timeout 180 git push origin HEAD:"$BRANCH" 2>&1; then
-                    echo "    ✅ Final batch pushed!"; break
-                  else
-                    echo "    ⚠️  Retry $PR/5..."
-                    sleep $(( 3 + RANDOM % 7 ))
-                    git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-                    git reset --hard origin/"$BRANCH" 2>/dev/null || true
-                    mkdir -p downloads
-                    cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-                    for BF in "${BATCH_FILES[@]}"; do git add "$BF" 2>/dev/null || true; done
-                    if ! git diff --cached --quiet 2>/dev/null; then
-                      git commit -m "📲 Add final batch [skip ci]" --quiet 2>/dev/null || true
-                    fi
-                  fi
-                done
-              fi
-            fi
-          }
-
-          echo ""
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "🚀 Starting incremental push..."
-          echo "═══════════════════════════════════════════════════════════════"
 
           echo "🔄 Syncing with remote..."
           git fetch origin "$BRANCH"
-          git reset --hard origin/"$BRANCH"
+          git pull --rebase origin "$BRANCH" || git pull origin "$BRANCH" --no-rebase
 
-          mkdir -p downloads
-          cp -r "$BACKUP_DIR"/* downloads/
+          echo ""
+          echo "📂 Files to commit:"
+          find downloads -type f -exec ls -lh {} \; 2>/dev/null || echo "  (no downloads)"
+          ls -lh Links.md 2>/dev/null || echo "  (no Links.md)"
 
-          echo "🔍 Scanning files..."
-          ALL_FILES=()
+          echo ""
+          echo "📦 Staging files..."
+          git add downloads/ Links.md
 
-          # READMEs first (small, aid navigation)
-          while IFS= read -r -d '' FILE; do
-            ALL_FILES+=("$FILE")
-          done < <(find downloads -name "README.md" -print0 2>/dev/null)
-
-          # Then all data files
-          while IFS= read -r -d '' FILE; do
-            ALL_FILES+=("$FILE")
-          done < <(find downloads -type f ! -name "README.md" -print0 2>/dev/null | sort -z)
-
-          TOTAL_FILES=${#ALL_FILES[@]}
-          echo "📦 Files found: $TOTAL_FILES"
-
-          if [ $TOTAL_FILES -eq 0 ]; then
-            echo "⚠️  No files to push!"
+          if git diff --staged --quiet; then
+            echo "ℹ️ No changes to commit"
             exit 0
           fi
 
-          TOTAL_SIZE=0
-          for F in "${ALL_FILES[@]}"; do
-            [ -f "$F" ] || continue
-            FS=$(stat -c%s "$F" 2>/dev/null || echo 0)
-            TOTAL_SIZE=$(( TOTAL_SIZE + FS ))
+          FILE_COUNT=$(git diff --staged --name-only | wc -l)
+          echo "📦 Committing $FILE_COUNT file(s)..."
+
+          git commit -m "📲 Telegram download: $FILE_COUNT file(s) [skip ci]"
+
+          echo "🚀 Pushing to $BRANCH..."
+          RETRY=0
+          MAX_RETRIES=5
+
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            RETRY=$((RETRY + 1))
+
+            if git push origin "HEAD:$BRANCH"; then
+              echo "✅ Push successful!"
+              break
+            else
+              echo "⚠️ Push failed (attempt $RETRY/$MAX_RETRIES)"
+              if [ $RETRY -lt $MAX_RETRIES ]; then
+                echo "🔄 Pulling and retrying..."
+                git pull --rebase origin "$BRANCH" || git pull origin "$BRANCH" --no-rebase
+                sleep $((2 + RANDOM % 5))
+              fi
+            fi
           done
-          TOTAL_SIZE_MB=$(( TOTAL_SIZE / 1024 / 1024 ))
-          echo "💾 Total size  : ${TOTAL_SIZE_MB} MB"
-          echo ""
 
-          if [ $TOTAL_SIZE_MB -lt 100 ]; then
-            echo "📤 Small upload — pushing all at once..."
-
-            git add -A downloads/
-            regenerate_master_readme
-            git add downloads/README.md
-
-            if ! git diff --cached --quiet; then
-              git commit -m "📲 Telegram download [skip ci]"
-              PR=0
-              while [ $PR -lt 10 ]; do
-                PR=$(( PR + 1 ))
-                if timeout 300 git push origin HEAD:"$BRANCH"; then
-                  echo "✅ Push successful!"; break
-                else
-                  echo "⚠️  Push failed, retry $PR/10..."
-                  sleep $(( 3 + RANDOM % 7 ))
-                  git fetch origin "$BRANCH"
-                  git reset --hard origin/"$BRANCH"
-                  mkdir -p downloads
-                  cp -r "$BACKUP_DIR"/* downloads/
-                  git add -A downloads/
-                  regenerate_master_readme
-                  git add downloads/README.md
-                  if ! git diff --cached --quiet; then
-                    git commit -m "📲 Telegram download [skip ci]"
-                  fi
-                fi
-              done
-            fi
-
-          else
-            echo "📤 Large upload (${TOTAL_SIZE_MB}MB) — incremental batch push..."
-            push_batch "${ALL_FILES[@]}"
-
-            echo ""
-            echo "📋 Updating master README..."
-            git fetch origin "$BRANCH" --quiet 2>/dev/null || true
-            git reset --hard origin/"$BRANCH" 2>/dev/null || true
-            mkdir -p downloads
-            cp -r "$BACKUP_DIR"/* downloads/ 2>/dev/null || true
-
-            regenerate_master_readme
-            git add downloads/README.md
-
-            if ! git diff --cached --quiet 2>/dev/null; then
-              git commit -m "📋 Update Telegram downloads list [skip ci]" --quiet 2>/dev/null || true
-              PR=0
-              while [ $PR -lt 5 ]; do
-                PR=$(( PR + 1 ))
-                if timeout 60 git push origin HEAD:"$BRANCH" 2>&1; then
-                  echo "✅ Master README pushed!"; break
-                else
-                  echo "⚠️  Retry $PR/5..."
-                  sleep 3
-                fi
-              done
-            fi
+          if [ $RETRY -eq $MAX_RETRIES ]; then
+            echo "❌ Push failed after $MAX_RETRIES attempts"
+            exit 1
           fi
 
           echo ""
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "🎉 All done! Files are in: downloads/${{ env.folder_name }}/"
-          echo "═══════════════════════════════════════════════════════════════"
+          echo "🎉 All files uploaded successfully!"
 
-      - name: 📋 Final report
+      - name: 📋 Final Report
         if: always()
         run: |
           echo ""
           echo "┌─────────────────────────────────────────────────────────────┐"
-          echo "│              📲 Telegram Downloader — Final Report          │"
+          echo "│           📲 Telegram Downloader — Final Report            │"
           echo "├─────────────────────────────────────────────────────────────┤"
-          echo "│ 🔗 Source  : ${{ github.event.inputs.telegram_link }}"
-          echo "│ 📁 Folder  : downloads/${{ env.folder_name }}/"
-          if [ -n "${{ github.event.inputs.password }}" ]; then
-            echo "│ 🔐 Archive : Password-protected"
-          else
-            echo "│ 🔓 Archive : No password"
+
+          if [ -f "/tmp/downloaded_files.json" ]; then
+            DOWNLOAD_COUNT=$(python3 -c "import json; print(len(json.load(open('/tmp/downloaded_files.json'))))" 2>/dev/null || echo "?")
+            echo "│ ✅ Downloaded : $DOWNLOAD_COUNT file(s)"
           fi
+
+          if [ -f "/tmp/failed_downloads.json" ]; then
+            FAILED_COUNT=$(python3 -c "import json; print(len(json.load(open('/tmp/failed_downloads.json'))))" 2>/dev/null || echo "0")
+            if [ "$FAILED_COUNT" != "0" ]; then
+              echo "│ ❌ Failed     : $FAILED_COUNT file(s)"
+            fi
+          fi
+
+          echo "│ 📁 Location   : ./downloads/<folder_name>/"
+          echo "│ 📄 Links      : ./Links.md"
+          echo "│ 📄 Index      : ./downloads/README.md"
+          echo "│ 📦 Format     : Standard ZIP (compatible with all tools)"
+
+          if [ -n "${{ github.event.inputs.password }}" ]; then
+            echo "│ 🔐 Archive    : Password-protected"
+          fi
+
           echo "└─────────────────────────────────────────────────────────────┘"
+
+          if [ -d "downloads" ]; then
+            echo ""
+            echo "📂 Downloaded files:"
+            find downloads -type f -exec ls -lh {} \; 2>/dev/null | head -20 || echo "  (empty)"
+          fi
